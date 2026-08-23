@@ -5,6 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
+import type { SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -18,6 +19,10 @@ export const MIN_GH_VERSION = "2.81.0";
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_TOKEN_BUDGET = 2_000;
 export const EXPANDED_TOKEN_BUDGET = 8_000;
+export const DEFAULT_SEARCH_LIMIT = 10;
+export const MAX_SEARCH_LIMIT = 50;
+export const MAX_SEARCH_PAGE = 10;
+export const DEFAULT_PR_FILES_LIMIT = 30;
 export const REPO_VIEW_FIELDS =
   "name,nameWithOwner,description,url,visibility,isPrivate,isFork,isArchived,stargazerCount,forkCount,primaryLanguage,defaultBranchRef,updatedAt,createdAt,homepageUrl,licenseInfo,repositoryTopics,owner";
 
@@ -26,6 +31,28 @@ const PULL_REQUEST_VIEW_FIELDS = "number,title,state,isDraft,author,assignees,la
 const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,isLatest,publishedAt,createdAt,url,author";
 const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,createdAt,updatedAt,url";
 const JOB_VIEW_FIELDS = "databaseId,name,status,conclusion,startedAt,completedAt,url,steps";
+
+export type ContentKind = "read_file" | "list_directory" | "pr_files" | "pr_diff";
+
+export interface SearchRequestInput {
+  kind: SearchKind;
+  query: string;
+  repo?: string;
+  limit?: number;
+  page?: number;
+  detail?: "compact" | "expanded";
+}
+
+export interface ContentRequestInput {
+  kind: ContentKind;
+  repo?: string;
+  path?: string;
+  ref?: string;
+  target?: string;
+  limit?: number;
+  page?: number;
+  detail?: "compact" | "expanded";
+}
 
 export interface GhExecRequest {
   argv: string[];
@@ -189,7 +216,88 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     return { projection, target };
   }
 
-  return { runView, ensureHost };
+  async function runSearch(
+    input: SearchRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<{ projection: Record<string, unknown>; target?: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    const target = input.repo ? resolveRepositoryTarget(input.repo) : undefined;
+    const limit = clamp(input.limit, DEFAULT_SEARCH_LIMIT, 1, MAX_SEARCH_LIMIT);
+    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    if (!input.query.trim()) throw new GhExecutionError("validation", "Search query must not be empty.");
+    await ensureGh(ctx.signal);
+    if (target) await ensureHost(target.host, ctx.signal);
+    const result = await run({
+      argv: buildSearchArgv(input.kind, input.query, target, limit, page),
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: DEFAULT_TIMEOUT_MS,
+    });
+    const decoded = decodeJson(result);
+    const projection = projectSearch(decoded, input.kind, input.query, page, limit, input.detail === "expanded");
+    return {
+      projection: await budgetProjection(
+        projection,
+        input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
+        tempOutput,
+        ["searchKind", "query", "page", "limit", "totalCount", "resultCount"],
+      ),
+      target,
+    };
+  }
+
+  async function runContent(
+    input: ContentRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    let target: ResourceTarget;
+    if (input.kind === "pr_files" || input.kind === "pr_diff") {
+      if (!input.target) throw new GhExecutionError("validation", "A pull-request target is required.");
+      target = resolveResourceTarget(input.target, { kind: "pull_request" });
+    } else {
+      if (!input.repo) throw new GhExecutionError("validation", "A repository target is required.");
+      target = resolveRepositoryTarget(input.repo);
+      validateRepositoryPath(input.path ?? "", input.kind === "read_file");
+    }
+    await ensureGh(ctx.signal);
+    if (target.kind === "current_checkout") {
+      throw new GhExecutionError("validation", "An explicit GitHub resource target is required.");
+    }
+    await ensureHost(target.host, ctx.signal);
+    const limit = clamp(
+      input.limit,
+      input.kind === "pr_files" ? DEFAULT_PR_FILES_LIMIT : input.kind === "list_directory" ? MAX_SEARCH_LIMIT : DEFAULT_SEARCH_LIMIT,
+      1,
+      MAX_SEARCH_LIMIT,
+    );
+    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const result = await run({
+      argv: buildContentArgv(input, target, limit, page),
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: DEFAULT_TIMEOUT_MS,
+    });
+    const projection =
+      input.kind === "pr_diff"
+        ? projectPullRequestDiff(result.stdout, target)
+        : input.kind === "read_file"
+          ? projectFile(decodeJson(result), target, input.path!, input.ref)
+          : input.kind === "list_directory"
+            ? projectDirectory(decodeJson(result), target, input.path ?? "", input.ref, limit)
+            : projectPullRequestFiles(decodeJson(result), target, page, limit);
+    return {
+      projection: await budgetProjection(
+        projection,
+        input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
+        tempOutput,
+        contentSummaryKeys(input.kind),
+      ),
+      target,
+    };
+  }
+
+  return { runView, runSearch, runContent, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -239,6 +347,252 @@ export function buildViewArgv(target: ResourceTarget): string[] {
     default:
       return assertNever(target);
   }
+}
+
+function resolveRepositoryTarget(raw: string): Extract<ResourceTarget, { kind: "repository" }> {
+  const target = resolveResourceTarget(raw, { kind: "repository" });
+  if (target.kind !== "repository") {
+    throw new GhExecutionError("validation", "An explicit repository target is required.");
+  }
+  return target;
+}
+
+function buildSearchArgv(
+  kind: SearchKind,
+  query: string,
+  target: Extract<ResourceTarget, { kind: "repository" }> | undefined,
+  limit: number,
+  page: number,
+): string[] {
+  const endpoint = kind === "repositories" ? "search/repositories" : kind === "code" ? "search/code" : kind === "commits" ? "search/commits" : "search/issues";
+  const qualifier = kind === "issues" ? "is:issue" : kind === "pull_requests" ? "is:pr" : undefined;
+  const scoped = [query, qualifier, target ? `repo:${target.owner}/${target.name}` : undefined]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
+  return [
+    "api",
+    ...hostnameArgs(target),
+    endpoint,
+    "--method",
+    "GET",
+    "--field",
+    `q=${scoped}`,
+    "--field",
+    `per_page=${limit}`,
+    "--field",
+    `page=${page}`,
+  ];
+}
+
+function buildContentArgv(input: ContentRequestInput, target: ResourceTarget, limit: number, page: number): string[] {
+  const repository = formatRepositoryTarget(target)!;
+  const cliRepository = cliRepositoryTarget(target);
+  switch (input.kind) {
+    case "read_file":
+    case "list_directory":
+      return [
+        "api",
+        ...hostnameArgs(target),
+        `repos/${repository}/contents${input.path ? `/${encodeRepositoryPath(input.path)}` : ""}`,
+        "--method",
+        "GET",
+        ...(input.ref ? ["--field", `ref=${input.ref}`] : []),
+      ];
+    case "pr_files":
+      return [
+        "api",
+        ...hostnameArgs(target),
+        `repos/${repository}/pulls/${targetNumber(target)}/files`,
+        "--method",
+        "GET",
+        "--field",
+        `per_page=${limit}`,
+        "--field",
+        `page=${page}`,
+      ];
+    case "pr_diff":
+      return ["pr", "diff", String(targetNumber(target)), "--repo", cliRepository];
+    default:
+      return assertNever(input.kind);
+  }
+}
+
+function projectSearch(
+  raw: unknown,
+  kind: SearchKind,
+  query: string,
+  page: number,
+  limit: number,
+  expanded: boolean,
+): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub search JSON was not an object.");
+  const value = raw as Record<string, unknown>;
+  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const results = rawItems.slice(0, limit).map((item) => compactSearchItem(item, expanded));
+  return {
+    kind: "search",
+    searchKind: kind,
+    query: redactSecrets(query),
+    page,
+    limit,
+    totalCount: asNumber(value.total_count),
+    incompleteResults: Boolean(value.incomplete_results),
+    resultCount: results.length,
+    results,
+  };
+}
+
+function compactSearchItem(raw: unknown, expanded: boolean): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { value: raw };
+  const value = raw as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const key of ["id", "number", "name", "full_name", "path", "sha", "title", "state", "url", "html_url", "score", "language", "private", "default_branch"]) {
+    if (value[key] !== undefined) result[key] = redactUnknown(value[key]);
+  }
+  if (value.repository && typeof value.repository === "object") {
+    const repository = value.repository as Record<string, unknown>;
+    result.repository = repository.full_name ?? repository.nameWithOwner ?? repository.name ?? null;
+  }
+  if (value.owner && typeof value.owner === "object") {
+    result.owner = (value.owner as Record<string, unknown>).login ?? (value.owner as Record<string, unknown>).name ?? null;
+  }
+  if (value.commit && typeof value.commit === "object") {
+    const commit = value.commit as Record<string, unknown>;
+    result.commit = { message: commit.message ?? null, author: commit.author ?? null };
+  }
+  if (expanded) {
+    for (const key of ["description", "body", "created_at", "updated_at", "author", "user", "labels"]) {
+      if (value[key] !== undefined) result[key] = redactUnknown(value[key]);
+    }
+  }
+  return result;
+}
+
+function projectFile(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined): Record<string, unknown> {
+  const base = { kind: "file", target, path, ref: ref ?? null };
+  if (typeof raw === "string") return { ...base, binary: false, encoding: "utf-8", byteCount: Buffer.byteLength(raw), content: raw };
+  if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub file JSON was not an object.");
+  const value = raw as Record<string, unknown>;
+  const encoding = typeof value.encoding === "string" ? value.encoding : undefined;
+  const content = typeof value.content === "string" ? value.content.replace(/\s/g, "") : undefined;
+  if (encoding === "base64" && content !== undefined) {
+    const bytes = Buffer.from(content, "base64");
+    const decoded = decodeUtf8(bytes);
+    if (decoded !== undefined && !decoded.includes("\u0000")) {
+      return { ...base, binary: false, encoding: "utf-8", byteCount: bytes.length, content: decoded };
+    }
+    return { ...base, binary: true, encoding: "base64", byteCount: bytes.length, contentBase64: content };
+  }
+  return {
+    ...base,
+    binary: false,
+    encoding: encoding ?? "utf-8",
+    byteCount: typeof value.size === "number" ? value.size : 0,
+    content: typeof value.content === "string" ? value.content : null,
+  };
+}
+
+function projectDirectory(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined, limit: number): Record<string, unknown> {
+  if (!Array.isArray(raw)) throw new GhExecutionError("malformed_json", "GitHub directory JSON was not an array.");
+  const entries = raw.slice(0, limit).map((entry) => compactDirectoryEntry(entry));
+  return { kind: "directory", target, path, ref: ref ?? null, entryCount: entries.length, entries };
+}
+
+function compactDirectoryEntry(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { value: raw };
+  const value = raw as Record<string, unknown>;
+  return Object.fromEntries(
+    ["name", "path", "type", "size", "sha", "url", "html_url"]
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, redactUnknown(value[key])]),
+  );
+}
+
+function projectPullRequestFiles(raw: unknown, target: ResourceTarget, page: number, limit: number): Record<string, unknown> {
+  let source: unknown[] | undefined;
+  if (Array.isArray(raw)) source = raw;
+  else if (raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).files)) {
+    source = (raw as Record<string, unknown>).files as unknown[];
+  }
+  if (!source) throw new GhExecutionError("malformed_json", "GitHub pull-request files JSON was not an array.");
+  const files = source.slice(0, limit).map((entry) => compactFileChange(entry));
+  return { kind: "pull_request_files", target, page, limit, fileCount: files.length, files };
+}
+
+function compactFileChange(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { value: raw };
+  const value = raw as Record<string, unknown>;
+  return Object.fromEntries(
+    ["filename", "status", "additions", "deletions", "changes", "sha", "blob_url", "raw_url", "contents_url", "previous_filename", "patch"]
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, redactUnknown(value[key])]),
+  );
+}
+
+function projectPullRequestDiff(raw: string, target: ResourceTarget): Record<string, unknown> {
+  return {
+    kind: "pull_request_diff",
+    target,
+    fileCount: (raw.match(/^diff --git /gm) ?? []).length,
+    lineCount: raw === "" ? 0 : raw.split("\n").length,
+    byteCount: Buffer.byteLength(raw),
+    diff: redactSecrets(raw),
+  };
+}
+
+function contentSummaryKeys(kind: ContentKind): readonly string[] {
+  switch (kind) {
+    case "read_file":
+      return ["path", "ref", "byteCount", "binary"];
+    case "list_directory":
+      return ["path", "ref", "entryCount"];
+    case "pr_files":
+      return ["target", "page", "limit", "fileCount"];
+    case "pr_diff":
+      return ["target", "fileCount", "lineCount", "byteCount"];
+    default:
+      return [];
+  }
+}
+
+function validateRepositoryPath(path: string, required: boolean): void {
+  if (!required && path === "") return;
+  if (!path || path.startsWith("/") || path.includes("\\") || path.includes("\u0000")) {
+    throw new GhExecutionError("validation", "Repository paths must be relative and must not contain backslashes or null bytes.");
+  }
+  if (path.split("/").some((part) => part === ".." || part === "." || part === "")) {
+    throw new GhExecutionError("validation", "Repository paths must not contain traversal segments.");
+  }
+}
+
+function encodeRepositoryPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+function targetNumber(target: ResourceTarget): number {
+  if (target.kind !== "pull_request") throw new GhExecutionError("validation", "A pull-request target is required.");
+  return target.number;
+}
+
+function decodeJson(result: GhExecResult): unknown {
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
+  }
+}
+
+function decodeUtf8(bytes: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function clamp(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
+  const numeric = Number.isFinite(value) ? Math.trunc(value!) : fallback;
+  return Math.max(minimum, Math.min(maximum, numeric));
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {
@@ -294,26 +648,39 @@ async function budgetProjection(
   projection: Record<string, unknown>,
   budget: number,
   tempOutput: TempOutput,
+  summaryKeys: readonly string[] = [],
 ): Promise<Record<string, unknown>> {
   const text = JSON.stringify(projection);
   const tokenCount = estimateProjectionTokens(text);
   if (tokenCount <= budget) return projection;
   const { path } = await tempOutput.write(text);
-  const keepName = estimateProjectionTokens(
-    JSON.stringify({
+  if (summaryKeys.length === 0) {
+    const keepName = estimateProjectionTokens(
+      JSON.stringify({
+        kind: projection.kind ?? "repository",
+        nameWithOwner: projection.nameWithOwner ?? null,
+        truncated: true,
+        omittedCount: 0,
+        tokenCount,
+        tokenBudget: budget,
+        fullPath: path,
+      }),
+    ) <= budget;
+    const kept = new Set(keepName ? ["kind", "nameWithOwner"] : ["kind"]);
+    return {
       kind: projection.kind ?? "repository",
-      nameWithOwner: projection.nameWithOwner ?? null,
+      ...(keepName ? { nameWithOwner: projection.nameWithOwner ?? null } : {}),
       truncated: true,
-      omittedCount: 0,
+      omittedCount: Object.keys(projection).filter((key) => !kept.has(key)).length,
       tokenCount,
       tokenBudget: budget,
       fullPath: path,
-    }),
-  ) <= budget;
-  const kept = new Set(keepName ? ["kind", "nameWithOwner"] : ["kind"]);
+    };
+  }
+  const kept = new Set(["kind", ...summaryKeys.filter((key) => key in projection)]);
   return {
-    kind: projection.kind ?? "repository",
-    ...(keepName ? { nameWithOwner: projection.nameWithOwner ?? null } : {}),
+    kind: projection.kind ?? "content",
+    ...Object.fromEntries(summaryKeys.filter((key) => key in projection).map((key) => [key, projection[key]])),
     truncated: true,
     omittedCount: Object.keys(projection).filter((key) => !kept.has(key)).length,
     tokenCount,
@@ -322,7 +689,8 @@ async function budgetProjection(
   };
 }
 
-function hostnameArgs(target: ResourceTarget): string[] {
+function hostnameArgs(target: ResourceTarget | undefined): string[] {
+  if (!target) return [];
   const host = formatHost(target);
   return host ? ["--hostname", host] : [];
 }

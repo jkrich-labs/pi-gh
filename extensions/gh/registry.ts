@@ -72,6 +72,62 @@ export const findParameters = Type.Object(
   { additionalProperties: false },
 );
 
+const detailParameter = () =>
+  StringEnum(["compact", "expanded"], {
+    description: "Projection detail. compact is the default.",
+    default: "compact",
+  });
+
+export const searchParameters = Type.Object(
+  {
+    query: Type.String({ description: "Search terms passed to GitHub" }),
+    repo: Type.Optional(Type.String({ description: "Optional repository target used to scope the search" })),
+    limit: Type.Optional(Type.Integer({ description: "Maximum results", minimum: 1, maximum: 50, default: 10 })),
+    page: Type.Optional(Type.Integer({ description: "Result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const readFileParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    path: Type.String({ description: "Repository-relative file path" }),
+    ref: Type.Optional(Type.String({ description: "Branch, tag, or commit ref" })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const listDirectoryParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    path: Type.Optional(Type.String({ description: "Repository-relative directory path" })),
+    ref: Type.Optional(Type.String({ description: "Branch, tag, or commit ref" })),
+    limit: Type.Optional(Type.Integer({ description: "Maximum directory entries", minimum: 1, maximum: 50, default: 50 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const pullRequestFilesParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    limit: Type.Optional(Type.Integer({ description: "Maximum changed files", minimum: 1, maximum: 50, default: 30 })),
+    page: Type.Optional(Type.Integer({ description: "Result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const pullRequestDiffParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -130,6 +186,144 @@ export const findOperation: Operation = {
   promptSnippet: "Find additional GitHub tools when the active tools are insufficient",
 };
 
+function readOperation(
+  definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
+): Operation {
+  return {
+    ...definition,
+    classification: "read",
+    decoderFixture: identity,
+    projectorFixture: identity,
+    decode: identity,
+    project: identity,
+  };
+}
+
+export const searchOperationKinds = {
+  gh_search_issues: "issues",
+  gh_search_pull_requests: "pull_requests",
+  gh_search_repositories: "repositories",
+  gh_search_code: "code",
+  gh_search_commits: "commits",
+} as const;
+
+export type SearchOperationName = keyof typeof searchOperationKinds;
+export type SearchKind = (typeof searchOperationKinds)[SearchOperationName];
+
+export const searchOperations: readonly Operation[] = [
+  readOperation({
+    name: "gh_search_issues",
+    label: "Search Issues",
+    description: "Search GitHub issues with bounded results and optional repository scoping.",
+    aliases: ["search issues", "issues", "bug reports", "tickets"],
+    keywords: ["search", "issue", "issues", "bug", "open", "closed"],
+    resourceKind: "issue",
+    verb: "search",
+    parameters: searchParameters,
+    argvFixture: ["api", "search/issues", "--method", "GET", "--field", "q=bug"],
+    buildArgv: () => ["api", "search/issues", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_search_pull_requests",
+    label: "Search Pull Requests",
+    description: "Search GitHub pull requests with bounded results and optional repository scoping.",
+    aliases: ["search pull requests", "search prs", "pull requests", "prs", "reviews"],
+    keywords: ["search", "pull", "request", "pr", "review", "changes"],
+    resourceKind: "pull request",
+    verb: "search",
+    parameters: searchParameters,
+    argvFixture: ["api", "search/issues", "--method", "GET", "--field", "q=is:pr"],
+    buildArgv: () => ["api", "search/issues", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_search_repositories",
+    label: "Search Repositories",
+    description: "Search GitHub repositories with bounded results and compact projections.",
+    aliases: ["search repositories", "search repos", "repositories", "repos", "projects"],
+    keywords: ["search", "repository", "repositories", "repo", "project"],
+    resourceKind: "repository",
+    verb: "search",
+    parameters: searchParameters,
+    argvFixture: ["api", "search/repositories", "--method", "GET", "--field", "q=pi"],
+    buildArgv: () => ["api", "search/repositories", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_search_code",
+    label: "Search Code",
+    description: "Search GitHub code with bounded results and optional repository scoping.",
+    aliases: ["search code", "code search", "source search", "symbols"],
+    keywords: ["search", "code", "source", "path", "file"],
+    resourceKind: "code",
+    verb: "search",
+    parameters: searchParameters,
+    argvFixture: ["api", "search/code", "--method", "GET", "--field", "q=main"],
+    buildArgv: () => ["api", "search/code", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_search_commits",
+    label: "Search Commits",
+    description: "Search GitHub commits with bounded results and compact projections.",
+    aliases: ["search commits", "commits", "commit history", "history"],
+    keywords: ["search", "commit", "commits", "history", "sha"],
+    resourceKind: "commit",
+    verb: "search",
+    parameters: searchParameters,
+    argvFixture: ["api", "search/commits", "--method", "GET", "--field", "q=fix"],
+    buildArgv: () => ["api", "search/commits", "--method", "GET"],
+  }),
+];
+
+export const contentOperations: readonly Operation[] = [
+  readOperation({
+    name: "gh_read_file",
+    label: "Read Repository File",
+    description: "Read a repository file at an optional ref without cloning the repository.",
+    aliases: ["read file", "file contents", "repository file", "source file"],
+    keywords: ["read", "file", "contents", "ref", "blob"],
+    resourceKind: "file",
+    verb: "read",
+    parameters: readFileParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/contents/path", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/contents/path", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_list_directory",
+    label: "List Repository Directory",
+    description: "List a repository directory at an optional ref without cloning the repository.",
+    aliases: ["list directory", "directory", "folder", "tree listing"],
+    keywords: ["list", "directory", "folder", "tree", "contents"],
+    resourceKind: "directory",
+    verb: "list",
+    parameters: listDirectoryParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/contents", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/contents", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_pr_files",
+    label: "Pull Request Files",
+    description: "List changed files in a pull request with bounded pagination.",
+    aliases: ["pull request files", "pr files", "changed files", "file list"],
+    keywords: ["pull", "request", "pr", "files", "changes", "diff"],
+    resourceKind: "pull request",
+    verb: "files",
+    parameters: pullRequestFilesParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/pulls/1/files", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/pulls/1/files", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_pr_diff",
+    label: "Pull Request Diff",
+    description: "Inspect a pull request patch with bounded output and truncation fallback.",
+    aliases: ["pull request diff", "pr diff", "patch", "changes diff"],
+    keywords: ["pull", "request", "pr", "diff", "patch", "changes"],
+    resourceKind: "pull request",
+    verb: "diff",
+    parameters: pullRequestDiffParameters,
+    argvFixture: ["pr", "diff", "1", "--repo", "OWNER/REPO"],
+    buildArgv: () => ["pr", "diff", "1", "--repo", "OWNER/REPO"],
+  }),
+];
+
 export interface OperationRegistry {
   readonly operations: readonly Operation[];
   get(name: string): Operation | undefined;
@@ -138,7 +332,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {

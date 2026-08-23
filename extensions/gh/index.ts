@@ -1,6 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createPipeline, createPiExecutor, type GhDependencies } from "./execute.ts";
-import { createRegistry, findParameters, type Operation, type OperationRegistry, viewParameters } from "./registry.ts";
+import {
+  createPipeline,
+  createPiExecutor,
+  type ContentRequestInput,
+  type GhDependencies,
+  type SearchRequestInput,
+} from "./execute.ts";
+import {
+  createRegistry,
+  findParameters,
+  listDirectoryParameters,
+  pullRequestDiffParameters,
+  pullRequestFilesParameters,
+  readFileParameters,
+  searchParameters,
+  searchOperationKinds,
+  type Operation,
+  type OperationRegistry,
+  type SearchKind,
+  viewParameters,
+} from "./registry.ts";
 
 export { GhExecutionError, type ErrorCategory } from "./errors.ts";
 export {
@@ -34,6 +53,10 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerViewTool(pi, operation, pipeline);
       } else if (operation.name === "gh_find") {
         registerFindTool(pi, operation, registry);
+      } else if (operation.name in searchOperationKinds) {
+        registerSearchTool(pi, operation, pipeline, searchOperationKinds[operation.name as keyof typeof searchOperationKinds]);
+      } else if (isContentOperation(operation.name)) {
+        registerContentTool(pi, operation, pipeline);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -113,6 +136,76 @@ function registerFindTool(pi: ExtensionAPI, operation: Operation, registry: Oper
       };
     },
   });
+}
+
+function registerSearchTool(
+  pi: ExtensionAPI,
+  operation: Operation,
+  pipeline: ReturnType<typeof createPipeline>,
+  kind: SearchKind,
+): void {
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: searchParameters,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const input = params as SearchRequestInput;
+      const { projection, target } = await pipeline.runSearch(
+        { ...input, kind },
+        { cwd: ctx.cwd, signal },
+      );
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection) }],
+        details: { kind: `search_${kind}`, target },
+      };
+    },
+  });
+}
+
+function registerContentTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>): void {
+  const schema = operation.name === "gh_read_file"
+    ? readFileParameters
+    : operation.name === "gh_list_directory"
+      ? listDirectoryParameters
+      : operation.name === "gh_pr_files"
+        ? pullRequestFilesParameters
+        : pullRequestDiffParameters;
+  const kind = operation.name === "gh_read_file"
+    ? "read_file"
+    : operation.name === "gh_list_directory"
+      ? "list_directory"
+      : operation.name === "gh_pr_files"
+        ? "pr_files"
+        : "pr_diff";
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const input: ContentRequestInput = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        path: typeof values.path === "string" ? values.path : undefined,
+        ref: typeof values.ref === "string" ? values.ref : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        limit: typeof values.limit === "number" ? values.limit : undefined,
+        page: typeof values.page === "number" ? values.page : undefined,
+        detail: values.detail === "expanded" ? "expanded" : "compact",
+      };
+      const { projection, target } = await pipeline.runContent(input, { cwd: ctx.cwd, signal });
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection) }],
+        details: { kind, target },
+      };
+    },
+  });
+}
+
+function isContentOperation(name: string): boolean {
+  return name === "gh_read_file" || name === "gh_list_directory" || name === "gh_pr_files" || name === "gh_pr_diff";
 }
 
 function registerUnimplementedTool(pi: ExtensionAPI, operation: Operation): void {
