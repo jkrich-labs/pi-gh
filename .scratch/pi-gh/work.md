@@ -199,10 +199,10 @@
 - **Tier:** general — registry metadata, ranking policy, schemas, execution, and live safety fixtures change together.
 - **Est. cost:** ~14k tokens / 25–40 minutes
 - **Acceptance criteria:**
-  - [ ] `node --test tests/loader.test.ts tests/registry-contract.test.ts tests/regression-hardening.test.ts --test-name-pattern='release|comment|read intent|write intent|unsafe'` passes.
-  - [ ] `node --test tests/content.test.ts --test-name-pattern='release|comment'` passes.
-  - [ ] `npm run typecheck` passes.
-- **Status:** ready
+  - [x] `node --test tests/loader.test.ts tests/registry-contract.test.ts tests/regression-hardening.test.ts --test-name-pattern='release|comment|read intent|write intent|unsafe'` passes.
+  - [x] `node --test tests/content.test.ts --test-name-pattern='release|comment'` passes.
+  - [x] `npm run typecheck` passes.
+- **Status:** complete
 
 ## S-13 — Tighten API projections and contextual errors
 

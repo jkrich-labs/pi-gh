@@ -132,6 +132,26 @@ export const pullRequestDiffParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const listReleasesParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    limit: Type.Optional(Type.Integer({ description: "Maximum releases on this page", minimum: 1, maximum: 50, default: 10 })),
+    page: Type.Optional(Type.Integer({ description: "Release result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const issueCommentsParameters = Type.Object(
+  {
+    target: Type.String({ description: "Issue URL or owner/repo#number" }),
+    limit: Type.Optional(Type.Integer({ description: "Maximum comments on this page", minimum: 1, maximum: 50, default: 10 })),
+    page: Type.Optional(Type.Integer({ description: "Comment result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
 export const workflowRunStatusValues = [
   "queued",
   "in_progress",
@@ -540,6 +560,41 @@ export const searchOperations: readonly Operation[] = [
   }),
 ];
 
+export const focusedReadOperationKinds = {
+  gh_list_releases: "list_releases",
+  gh_issue_comments: "issue_comments",
+} as const;
+
+export type FocusedReadOperationName = keyof typeof focusedReadOperationKinds;
+export type FocusedReadKind = (typeof focusedReadOperationKinds)[FocusedReadOperationName];
+
+export const focusedReadOperations: readonly Operation[] = [
+  readOperation({
+    name: "gh_list_releases",
+    label: "List Releases",
+    description: "List a bounded page of repository releases with compact or expanded asset projections.",
+    aliases: ["list releases", "repository releases", "release list"],
+    keywords: ["list", "release", "releases", "asset", "assets", "page"],
+    resourceKind: "release",
+    verb: "list",
+    parameters: listReleasesParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/releases", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/releases", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_issue_comments",
+    label: "Read Issue Comments",
+    description: "Read a bounded page of comments for one issue without changing the discussion.",
+    aliases: ["read issue comments", "issue comments", "list issue comments", "view issue comments"],
+    keywords: ["read", "view", "list", "issue", "issues", "comment", "comments", "page"],
+    resourceKind: "issue comments",
+    verb: "read",
+    parameters: issueCommentsParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/issues/1/comments", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/issues/1/comments", "--method", "GET"],
+  }),
+];
+
 export const contentOperations: readonly Operation[] = [
   readOperation({
     name: "gh_read_file",
@@ -797,7 +852,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...actionReleaseOperations, ...apiOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...focusedReadOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...actionReleaseOperations, ...apiOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {
@@ -819,8 +874,27 @@ export function createRegistry(additional: readonly Operation[] = []): Operation
       const terms = tokenize(query);
       if (terms.length === 0) return [];
       const max = Math.max(1, Math.min(5, Math.trunc(limit)));
+      const writeVocabulary = new Set(["a", "an", "the", "to", "on", "for", "with", "and", "it", "this", "that", "existing", "github", "please", "again", "changes", "notes"]);
+      STRONG_WRITE_INTENT_TERMS.forEach((term) => writeVocabulary.add(term));
+      ["comment", "review", "run", "request", "reply", "open", "squash", "stop"].forEach((term) => writeVocabulary.add(term));
+      const writeOperations = operations.filter((operation) => operation.classification !== "read");
+      for (const operation of writeOperations) {
+        for (const value of [operation.name.replace(/^gh_/, ""), operation.verb, operation.resourceKind, ...operation.aliases, ...operation.keywords]) {
+          tokenize(value).forEach((term) => {
+            writeVocabulary.add(term);
+            if (term.endsWith("s") && term.length > 1) writeVocabulary.add(term.slice(0, -1));
+          });
+        }
+      }
+      const exactWriteAliases = new Set(writeOperations
+        .filter((operation) => operation.aliases.some((alias) => tokenize(alias).join(" ") === terms.join(" ")))
+        .map((operation) => operation.name));
+      const intent = discoveryIntent(terms, exactWriteAliases.size > 0, writeVocabulary);
       return operations
         .filter((operation) => operation.name !== findOperation.name)
+        .filter((operation) => exactWriteAliases.size > 0
+          ? exactWriteAliases.has(operation.name)
+          : operationMatchesDiscoveryIntent(operation, terms, intent))
         .map((operation, index) => ({ operation, index, score: scoreOperation(operation, terms) }))
         .filter((entry) => entry.score > 0)
         .sort((left, right) => right.score - left.score || left.index - right.index || left.operation.name.localeCompare(right.operation.name))
@@ -831,14 +905,204 @@ export function createRegistry(additional: readonly Operation[] = []): Operation
 }
 
 function tokenize(value: string): string[] {
-  return value.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
+  // Preserve non-ASCII words and symbols as tokens. Dropping them could turn
+  // an informational query suffix into an exact mutation alias.
+  return value.toLowerCase().match(/[\p{L}\p{N}_]+|[^\p{L}\p{N}\p{Z}_\t\n\r\f\v]+/gu) ?? [];
+}
+
+type DiscoveryIntent = "read" | "write";
+
+const EXPLICIT_READ_INTENT_TERMS = new Set([
+  "read", "view", "list", "inspect", "show", "get", "fetch", "download", "search", "browse", "find", "locate",
+  "explain", "describe", "how", "what", "which", "history", "status", "details", "count", "about", "safe", "should", "whether", "can",
+  "documentation", "docs", "guide", "tutorial", "example", "examples", "syntax", "format", "formatting", "usage",
+]);
+const STRONG_WRITE_INTENT_TERMS = new Set([
+  "add", "assign", "approve", "cancel", "close", "create", "delete", "dispatch", "edit", "label", "merge", "new",
+  "publish", "rebase", "reopen", "rerun", "remove", "reply", "resolve", "retry", "squash", "stop", "sync", "update", "upload",
+]);
+function discoveryIntent(terms: string[], exactWriteAlias = false, writeVocabulary = new Set<string>()): DiscoveryIntent {
+  if (terms.some((term) => EXPLICIT_READ_INTENT_TERMS.has(term))) return "read";
+  if (exactWriteAlias) return "write";
+  // Discovery queries describe a capability, not mutation payload content.
+  // Unknown vocabulary therefore fails closed to reads instead of guessing
+  // that a leading action word is imperative (for example, docs/manual text).
+  if (terms.some((term) => !writeVocabulary.has(term))) return "read";
+  const leadIndex = terms[0] === "please" ? 1 : 0;
+  const lead = terms[leadIndex];
+  if (!lead) return "read";
+  const imperativeWrite = STRONG_WRITE_INTENT_TERMS.has(lead)
+    || ["comment", "review", "run", "request", "reply", "open"].includes(lead);
+  if (!imperativeWrite) return "read";
+  // "open issues" and "open pull requests" describe state; singular forms
+  // are the create aliases. All other writes require a leading action verb,
+  // so noun-only and explanatory requests fail closed to reads.
+  if (lead === "open" && terms.some((term) => ["issues", "requests", "prs", "pulls"].includes(term))) return "read";
+  return "write";
+}
+
+function operationMatchesDiscoveryIntent(operation: Operation, terms: string[], intent: DiscoveryIntent): boolean {
+  if (intent === "read") {
+    if (operation.classification !== "read") return false;
+    return matchesFocusedReadRequest(operation, terms);
+  }
+  if (intent === "write") {
+    if (operation.classification === "read") return false;
+    return matchesWriteRequest(operation, terms);
+  }
+  return true;
+}
+
+function matchesFocusedReadRequest(operation: Operation, terms: string[]): boolean {
+  const requested = new Set<string>();
+  const issue = terms.includes("issue") || terms.includes("issues");
+  const release = terms.includes("release") || terms.includes("releases");
+  const comments = terms.includes("comment") || terms.includes("comments");
+  const pullRequest = terms.some((term) => ["pull", "pulls", "pr", "prs", "pull_request"].includes(term));
+  if ((terms.includes("search") || terms.includes("open")) && issue) requested.add("gh_search_issues");
+  if (terms.includes("open") && pullRequest) requested.add("gh_search_pull_requests");
+  if (comments && issue) requested.add("gh_issue_comments");
+  if (release && (terms.includes("list") || terms.includes("releases"))) requested.add("gh_list_releases");
+  if (pullRequest && terms.includes("files")) requested.add("gh_pr_files");
+  if (pullRequest && (terms.includes("diff") || terms.includes("patch"))) requested.add("gh_pr_diff");
+  // Once the request names focused reads, do not fill a bounded result with
+  // generic views or unrelated search families.
+  if (requested.size > 0) return requested.has(operation.name);
+  return matchesReadResourceFocus(operation, terms);
+}
+
+function matchesReadResourceFocus(operation: Operation, terms: string[]): boolean {
+  if (operation.name.startsWith("gh_search_") && !terms.includes("search")) return false;
+  if (operation.name === "gh_list_releases" && !terms.includes("list") && !terms.includes("releases")) return false;
+  if (operation.name === "gh_view") return true;
+  if (operation.name === "gh_api_get" && terms.some((term) => ["api", "rest", "endpoint"].includes(term))) return true;
+  const resource = operation.resourceKind.toLowerCase();
+  const focused = [
+    [["issue", "issues"], "issue"],
+    [["pull", "pulls", "pr", "prs", "pull_request"], "pull request"],
+    [["repository", "repositories", "repo"], "repository"],
+    [["release", "releases"], "release"],
+    [["workflow", "workflows"], "workflow"],
+    [["run", "runs"], "run"],
+    [["job", "jobs"], "job"],
+    [["directory", "directories", "folder"], "directory"],
+    [["file", "files"], "file"],
+    [["commit", "commits"], "commit"],
+  ] as const;
+  for (const [termsForResource, expectedResource] of focused) {
+    if (terms.some((term) => termsForResource.some((candidate) => candidate === term)) && !resource.includes(expectedResource)) return false;
+  }
+  return true;
+}
+
+function matchesWriteRequest(operation: Operation, terms: string[]): boolean {
+  const requestedAction = primaryWriteAction(terms);
+  if (!requestedAction || !writeActionsForOperation(operation).has(requestedAction)) return false;
+  return resourceTermsMatch(operation, terms);
+}
+
+function primaryWriteAction(terms: string[]): string | undefined {
+  const leadIndex = terms[0] === "please" ? 1 : 0;
+  const lead = terms[leadIndex];
+  const subject = terms.slice(leadIndex + 1).find((term) => !["a", "an", "the", "new"].includes(term));
+  const has = (...values: string[]) => values.some((value) => terms.includes(value));
+  switch (lead) {
+    case "rerun":
+    case "retry": return "rerun";
+    case "cancel":
+    case "stop": return "cancel";
+    case "reopen": return "reopen";
+    case "open": return has("again") ? "reopen" : "create";
+    case "close":
+    case "resolve": return "close";
+    case "request":
+    case "approve":
+    case "review": return "review";
+    case "merge":
+    case "squash":
+    case "rebase": return "merge";
+    case "delete":
+    case "remove": return "delete";
+    case "upload": return "upload";
+    case "comment":
+    case "reply": return "comment";
+    case "dispatch":
+    case "run": return "dispatch";
+    case "workflow": return has("dispatch") ? "dispatch" : undefined;
+    case "create": return ["comment", "reply"].includes(subject ?? "") ? "comment" : ["label", "labels", "reviewer", "reviewers", "assignee", "assignees", "milestone"].includes(subject ?? "") ? "edit" : ["asset", "assets"].includes(subject ?? "") ? "upload" : "create";
+    case "publish":
+    case "new": return "create";
+    case "add": return has("comment", "reply") ? "comment" : has("asset", "assets") ? "upload" : "edit";
+    case "assign":
+    case "label":
+    case "edit": return "edit";
+    case "update": return has("branch") ? "update" : "edit";
+    case "sync": return "update";
+    default: return undefined;
+  }
+}
+
+function writeActionsForOperation(operation: Operation): Set<string> {
+  const actions = new Set<string>();
+  const verb = operation.verb.toLowerCase();
+  if (verb === "create") {
+    actions.add("create");
+    actions.add("open");
+  }
+  if (verb === "comment") {
+    actions.add("comment");
+    actions.add("add");
+  }
+  if (verb === "edit") {
+    actions.add("edit");
+    actions.add("add");
+    actions.add("assign");
+    actions.add("label");
+  }
+  if (verb === "close") actions.add("close");
+  if (verb === "reopen") actions.add("reopen");
+  if (verb === "review") {
+    actions.add("review");
+    actions.add("approve");
+  }
+  if (verb === "merge") actions.add("merge");
+  if (verb === "update branch") actions.add("update");
+  if (verb === "dispatch") actions.add("dispatch");
+  if (verb === "cancel") actions.add("cancel");
+  if (verb === "rerun") actions.add("rerun");
+  if (verb === "upload") actions.add("upload");
+  if (verb === "delete") actions.add("delete");
+  return actions;
+}
+
+function resourceTermsMatch(operation: Operation, terms: string[]): boolean {
+  const resource = operation.resourceKind.toLowerCase();
+  const issue = terms.includes("issue") || terms.includes("issues");
+  const pullRequest = terms.some((term) => ["pull", "pulls", "pr", "prs", "pull_request"].includes(term));
+  const release = terms.includes("release") || terms.includes("releases");
+  const asset = terms.includes("asset") || terms.includes("assets");
+  const workflow = terms.includes("workflow") || terms.includes("workflows");
+  const run = terms.includes("run") || terms.includes("runs");
+  if (issue && !resource.includes("issue")) return false;
+  if (pullRequest && !resource.includes("pull request")) return false;
+  if (release && !resource.includes("release")) return false;
+  if (asset && !resource.includes("asset")) return false;
+  if (release && !asset && resource.includes("asset")) return false;
+  if (workflow && !resource.includes("workflow")) return false;
+  if (run && !workflow && !resource.includes("run")) return false;
+  return true;
 }
 
 function scoreOperation(operation: Operation, terms: string[]): number {
+  // Focused readers should never displace a generic resource view until their
+  // subject is explicit. "read issue" is a view; "read issue comments" is
+  // the comments reader.
+  if (operation.name === "gh_issue_comments" && !terms.some((term) => term === "comment" || term === "comments")) return 0;
+  if (operation.name === "gh_list_releases" && !terms.some((term) => term === "release" || term === "releases")) return 0;
   if (operation.name === "gh_api_get") {
     const explicitApiInterest = terms.some((term) => ["api", "rest", "endpoint", "raw", "escape"].includes(term));
     const getStyle = terms.includes("get");
-    const focusedResource = new Set(["issue", "issues", "pull", "pulls", "pr", "pull_request", "repository", "repositories", "repo", "release", "run", "runs", "workflow_run", "job", "jobs", "file", "files", "tree", "directory", "directories", "commit", "commits", "compare", "workflow", "workflows", "checks", "check", "logs", "log", "ci", "diff", "content", "search"]);
+    const focusedResource = new Set(["issue", "issues", "pull", "pulls", "pr", "prs", "pull_request", "repository", "repositories", "repo", "release", "run", "runs", "workflow_run", "job", "jobs", "file", "files", "tree", "directory", "directories", "commit", "commits", "compare", "workflow", "workflows", "checks", "check", "logs", "log", "ci", "diff", "content", "search"]);
     /* The API escape hatch surfaces for "api get ..." queries, and yields to the
      * focused tools when a concrete resource dominates the query (issue 12). */
     const apiLedGet = explicitApiInterest && getStyle;
@@ -853,11 +1117,12 @@ function scoreOperation(operation: Operation, terms: string[]): number {
 
   // Alias-phrase matches still win: they are the human signal for the operation.
   let score = aliases.some((alias) => alias.replace(/[^a-z0-9]+/g, " ").trim() === terms.join(" ")) ? 300 : 0;
+  if (operation.name === "gh_search_pull_requests" && terms.includes("open") && terms.some((term) => ["pulls", "prs"].includes(term))) score += 150;
 
   // gh_view as a generic fallback should never outrank a real operation for a
   // specific action word (comment, close, merge...). Drop its bonus when any
   // verb-style term exists.
-  if (operation.name === "gh_view" && terms.some((term) => ["issue", "issues", "pull", "pr", "pull_request", "repository", "repo", "release", "run", "workflow_run", "job", "file", "tree", "commit", "compare"].includes(term))) {
+  if (operation.name === "gh_view" && terms.some((term) => ["issue", "issues", "pull", "pulls", "pr", "prs", "pull_request", "repository", "repo", "release", "run", "workflow_run", "job", "file", "tree", "commit", "compare"].includes(term))) {
     score += 100;
   }
   if (operation.name === "gh_view" && terms.some((term) => ["comment", "close", "reopen", "merge", "review", "edit", "approve", "checks", "logs", "list", "search", "create", "files", "diff", "update", "branch", "release", "dispatch"].includes(term))) {

@@ -27,3 +27,19 @@ test("every registered operation has strict metadata and executable contract fix
     assert.deepEqual(operation.projectorFixture(decoded), { fixture: true });
   }
 });
+
+test("focused release and issue-comment reads have bounded strict registry fixtures", () => {
+  const registry = createRegistry();
+  const releases = registry.get("gh_list_releases");
+  const comments = registry.get("gh_issue_comments");
+  assert.equal(releases?.classification, "read");
+  assert.equal(comments?.classification, "read");
+  assert.deepEqual(releases?.argvFixture, ["api", "repos/OWNER/REPO/releases", "--method", "GET"]);
+  assert.deepEqual(comments?.argvFixture, ["api", "repos/OWNER/REPO/issues/1/comments", "--method", "GET"]);
+  const releaseSchema = releases?.parameters as { properties?: Record<string, { minimum?: number; maximum?: number }> };
+  const commentSchema = comments?.parameters as { properties?: Record<string, { minimum?: number; maximum?: number }> };
+  assert.equal(releaseSchema.properties?.limit?.minimum, 1);
+  assert.equal(releaseSchema.properties?.limit?.maximum, 50);
+  assert.equal(commentSchema.properties?.page?.minimum, 1);
+  assert.equal(commentSchema.properties?.page?.maximum, 10);
+});

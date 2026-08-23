@@ -3,9 +3,11 @@ import { GhExecutionError } from "./errors.ts";
 import {
   createPipeline,
   createPiExecutor,
+  redactResourceTarget,
   type ApiGetRequestInput,
   type ActionReleaseRequestInput,
   type ContentRequestInput,
+  type FocusedReadRequestInput,
   type GhDependencies,
   type IssueRequestInput,
   type PullRequestRequestInput,
@@ -26,9 +28,11 @@ import {
   editIssueParameters,
   editReleaseParameters,
   failedLogsParameters,
+  focusedReadOperationKinds,
   findParameters,
   issueOperationKinds,
   issueCommentParameters,
+  issueCommentsParameters,
   issueStateParameters,
   jobParameters,
   createPullRequestParameters,
@@ -39,6 +43,7 @@ import {
   reviewPullRequestParameters,
   updatePullRequestBranchParameters,
   listDirectoryParameters,
+  listReleasesParameters,
   pullRequestDiffParameters,
   pullRequestFilesParameters,
   readFileParameters,
@@ -52,6 +57,7 @@ import {
   type ActionReleaseKind,
   type ApiKind,
   type CiKind,
+  type FocusedReadKind,
   type OperationRegistry,
   type PullRequestKind,
   type SearchKind,
@@ -93,6 +99,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerFindTool(pi, operation, registry);
       } else if (operation.name in searchOperationKinds) {
         registerSearchTool(pi, operation, pipeline, searchOperationKinds[operation.name as keyof typeof searchOperationKinds]);
+      } else if (operation.name in focusedReadOperationKinds) {
+        registerFocusedReadTool(pi, operation, pipeline, focusedReadOperationKinds[operation.name as keyof typeof focusedReadOperationKinds]);
       } else if (isContentOperation(operation.name)) {
         registerContentTool(pi, operation, pipeline);
       } else if (operation.name in ciOperationKinds) {
@@ -215,6 +223,37 @@ function registerSearchTool(
       return {
         content: [{ type: "text", text: JSON.stringify(projection) }],
         details: { kind: `search_${kind}`, target },
+      };
+    },
+  });
+}
+
+function registerFocusedReadTool(
+  pi: ExtensionAPI,
+  operation: Operation,
+  pipeline: ReturnType<typeof createPipeline>,
+  kind: FocusedReadKind,
+): void {
+  const schema = operation.name === "gh_list_releases" ? listReleasesParameters : issueCommentsParameters;
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const input: FocusedReadRequestInput = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        limit: typeof values.limit === "number" ? values.limit : undefined,
+        page: typeof values.page === "number" ? values.page : undefined,
+        detail: values.detail === "expanded" ? "expanded" : "compact",
+      };
+      const { projection, target } = await pipeline.runFocusedRead(input, { cwd: ctx.cwd, signal });
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection) }],
+        details: { kind, target: redactResourceTarget(target) },
       };
     },
   });

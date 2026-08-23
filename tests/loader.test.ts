@@ -172,6 +172,160 @@ test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () =
   }
 });
 
+test("gh_find keeps explicit read intent free of routine and guarded operations", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  for (const query of [
+    "list repository releases",
+    "view a GitHub release by tag",
+    "list releases and assets, then download an asset",
+    "view issue comments",
+    "comments for issue",
+    "read issue comment",
+    "view issue comment",
+    "inspect pull request comment",
+    "read a pull request review",
+    "list open issues",
+    "show closed PRs",
+    "get issue",
+    "fetch release",
+    "download release asset",
+    "view merge commit",
+    "show a pull request merge commit",
+    "view new issues",
+    "view pull request before merge",
+    "locate an issue comment",
+    "How do I close a GitHub issue?",
+    "Explain how to delete a release",
+    "issue comment history",
+    "workflow run history",
+    "open issues",
+    "open pull requests",
+    "is it safe to merge a pull request",
+    "should I close this issue",
+    "open PRs",
+    "open pulls",
+    "comment count",
+    "delete release documentation",
+    "comment on issue formatting guide",
+    "delete release manual",
+    "create issue reference",
+    "delete release guides",
+    "create issue guides",
+    "comment on issue ドキュメント",
+    "delete release 📖",
+    "comment on issue?",
+    "delete release?",
+    "comment on issue、",
+    "delete release。",
+    "comment on issue\u200B",
+    "delete release\u200B",
+    "comment on issue\uFEFF",
+    "delete release\uFEFF",
+    "create issue\uFEFF",
+  ]) {
+    const projection = projectionOf(await tool.execute(query, { query, limit: 5 }, undefined, undefined, toolCtx() as never)) as {
+      matches: Array<{ name: string; classification: string }>;
+    };
+    assert.ok(projection.matches.length > 0, query);
+    assert.equal(projection.matches.every((match) => match.classification === "read"), true, query);
+  }
+  const releases = projectionOf(await tool.execute("release-list", { query: "list repository releases", limit: 1 }, undefined, undefined, toolCtx() as never)) as {
+    matches: Array<{ name: string }>;
+  };
+  assert.equal(releases.matches[0]?.name, "gh_list_releases");
+  const comments = projectionOf(await tool.execute("comment-read", { query: "read issue comments", limit: 1 }, undefined, undefined, toolCtx() as never)) as {
+    matches: Array<{ name: string }>;
+  };
+  assert.equal(comments.matches[0]?.name, "gh_issue_comments");
+});
+
+test("gh_find ranks exact write intent without unrelated mutations", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  for (const [query, expected, excluded] of [
+    ["add a comment to an existing GitHub issue", "gh_comment_issue", "gh_create_issue"],
+    ["new issue", "gh_create_issue", "gh_close_issue"],
+    ["reply to an issue", "gh_comment_issue", "gh_close_issue"],
+    ["create pull request", "gh_create_pull_request", "gh_review_pull_request"],
+    ["comment on pull request", "gh_comment_pull_request", "gh_review_pull_request"],
+    ["open issue", "gh_create_issue", "gh_close_issue"],
+    ["open pull request", "gh_create_pull_request", "gh_review_pull_request"],
+    ["run workflow", "gh_dispatch_workflow", "gh_rerun_workflow_run"],
+    ["request changes on a pull request", "gh_review_pull_request", "gh_comment_pull_request"],
+    ["update issue labels", "gh_edit_issue", "gh_create_issue"],
+    ["add a reviewer to a pull request", "gh_edit_pull_request", "gh_comment_pull_request"],
+    ["rerun workflow run", "gh_rerun_workflow_run", "gh_dispatch_workflow"],
+    ["open pull request with labels", "gh_create_pull_request", "gh_edit_pull_request"],
+    ["create issue with labels", "gh_create_issue", "gh_edit_issue"],
+    ["upload a new release asset", "gh_upload_release_asset", "gh_create_release"],
+    ["add a new label to an issue", "gh_edit_issue", "gh_create_issue"],
+    ["update release notes", "gh_edit_release", "gh_create_release"],
+    ["open issue again", "gh_reopen_issue", "gh_create_issue"],
+    ["squash pull request", "gh_merge_pull_request", "gh_create_pull_request"],
+    ["stop workflow", "gh_cancel_workflow_run", "gh_dispatch_workflow"],
+    ["comment on issue and close it", "gh_comment_issue", "gh_close_issue"],
+    ["workflow dispatch", "gh_dispatch_workflow", "gh_cancel_workflow_run"],
+    ["create a comment on an issue", "gh_comment_issue", "gh_create_issue"],
+    ["create a comment on a pull request", "gh_comment_pull_request", "gh_create_pull_request"],
+    ["create a label on an issue", "gh_edit_issue", "gh_create_issue"],
+    ["issue comment", "gh_comment_issue", "gh_create_issue"],
+    ["pull request comment", "gh_comment_pull_request", "gh_review_pull_request"],
+    ["issue metadata", "gh_edit_issue", "gh_create_issue"],
+    ["pull request metadata", "gh_edit_pull_request", "gh_review_pull_request"],
+    ["release metadata", "gh_edit_release", "gh_delete_release"],
+    ["release asset", "gh_upload_release_asset", "gh_delete_release_asset"],
+  ] as const) {
+    const projection = projectionOf(await tool.execute(
+      "write-intent",
+      { query, limit: 5 },
+      undefined,
+      undefined,
+      toolCtx() as never,
+    )) as { matches: Array<{ name: string; classification: string }> };
+    assert.equal(projection.matches[0]?.name, expected, query);
+    assert.equal(projection.matches.some((match) => match.name === excluded), false, query);
+    assert.equal(projection.matches.every((match) => match.classification !== "read"), true, query);
+  }
+});
+
+test("gh_find maps open state listings to applicable search tools", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  for (const [query, expected] of [
+    ["open issues", "gh_search_issues"],
+    ["open PRs", "gh_search_pull_requests"],
+    ["open pulls", "gh_search_pull_requests"],
+  ]) {
+    const projection = projectionOf(await tool.execute(
+      "open-state",
+      { query, limit: 5 },
+      undefined,
+      undefined,
+      toolCtx() as never,
+    )) as { matches: Array<{ name: string; classification: string }> };
+    assert.equal(projection.matches[0]?.name, expected, query);
+    assert.equal(projection.matches.every((match) => match.classification === "read"), true, query);
+  }
+});
+
+test("gh_find scopes issue searches and comment reads to the requested resources", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const projection = projectionOf(await tool.execute(
+    "issue-search-comments",
+    { query: "search issues and read their comments", limit: 5 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  )) as { matches: Array<{ name: string }> };
+  assert.deepEqual(projection.matches.map((match) => match.name), ["gh_search_issues", "gh_issue_comments"]);
+});
+
 test("gh_view remains callable after additive loading", async () => {
   const loaded = loadExtension({ executor: scriptedExecutor().execute }, { activeTools: ["read"] });
   const tool = loaded.tools.get("gh_view");

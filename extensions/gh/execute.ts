@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, describeFailureWithContext, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { ActionReleaseKind, ApiKind, CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
+import type { ActionReleaseKind, ApiKind, CiKind, FocusedReadKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -63,6 +63,15 @@ export interface ContentRequestInput {
   repo?: string;
   path?: string;
   ref?: string;
+  target?: string;
+  limit?: number;
+  page?: number;
+  detail?: "compact" | "expanded";
+}
+
+export interface FocusedReadRequestInput {
+  kind: FocusedReadKind;
+  repo?: string;
   target?: string;
   limit?: number;
   page?: number;
@@ -171,6 +180,10 @@ export type GhExecutor = (request: GhExecRequest) => Promise<GhExecResult>;
 
 export interface TempOutput {
   write(content: string): Promise<{ path: string }>;
+}
+
+export function redactResourceTarget(target: ResourceTarget): ResourceTarget {
+  return redactUnknown(target) as ResourceTarget;
 }
 
 export interface GhDependencies {
@@ -476,6 +489,47 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     };
   }
 
+  async function runFocusedRead(
+    input: FocusedReadRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    const target = input.kind === "list_releases"
+      ? resolveRepositoryTarget(input.repo ?? "")
+      : resolveIssueTarget(input.target ?? "");
+    await ensureGh(ctx.signal);
+    await ensureHost(target.host, ctx.signal);
+    const limit = clamp(input.limit, DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_PAGE * 5);
+    const page = clamp(input.page, 1, 1, MAX_RESULT_PAGE);
+    const operation = input.kind === "list_releases" ? "listing releases" : "reading issue comments";
+    const result = await run({
+      argv: buildFocusedReadArgv(input.kind, target, limit, page),
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: DEFAULT_TIMEOUT_MS,
+    }, describeTarget(target));
+    const decoded = decodeFocusedReadJson(result, operation, target);
+    let projection: Record<string, unknown>;
+    if (input.kind === "list_releases") {
+      if (target.kind !== "repository") throw new GhExecutionError("validation", "Listing releases requires a repository target.");
+      projection = projectReleaseList(decoded, target, page, limit, input.detail === "expanded");
+    } else {
+      if (target.kind !== "issue") throw new GhExecutionError("validation", "Reading issue comments requires an issue target.");
+      projection = projectIssueComments(decoded, target, page, limit, input.detail === "expanded");
+    }
+    return {
+      projection: await budgetProjection(
+        projection,
+        input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
+        tempOutput,
+        input.kind === "list_releases"
+          ? ["target", "page", "limit", "releaseCount"]
+          : ["target", "page", "limit", "commentCount"],
+      ),
+      target,
+    };
+  }
+
   async function runCi(
     input: CiRequestInput,
     ctx: { cwd: string; signal?: AbortSignal },
@@ -665,7 +719,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     return { projection: { kind: actionReleaseResultKind(input.kind), target, output: result.stdout.trim() }, target };
   }
 
-  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, runApiGet, ensureHost };
+  return { runView, runSearch, runContent, runFocusedRead, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, runApiGet, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget, detail: "compact" | "expanded" = "compact"): string[] {
@@ -749,6 +803,28 @@ function buildSearchArgv(
     "GET",
     "--field",
     `q=${scoped}`,
+    "--field",
+    `per_page=${limit}`,
+    "--field",
+    `page=${page}`,
+  ];
+}
+
+function buildFocusedReadArgv(kind: FocusedReadKind, target: ResourceTarget, limit: number, page: number): string[] {
+  const repository = formatRepositoryTarget(target);
+  if (!repository) throw new GhExecutionError("validation", "An explicit GitHub resource target is required.");
+  const endpoint = kind === "list_releases"
+    ? `repos/${repository}/releases`
+    : target.kind === "issue"
+      ? `repos/${repository}/issues/${target.number}/comments`
+      : undefined;
+  if (!endpoint) throw new GhExecutionError("validation", "Issue comments require an issue target.");
+  return [
+    "api",
+    ...hostnameArgs(target),
+    endpoint,
+    "--method",
+    "GET",
     "--field",
     `per_page=${limit}`,
     "--field",
@@ -1013,6 +1089,17 @@ function decodeJson(result: GhExecResult): unknown {
     return JSON.parse(result.stdout);
   } catch {
     throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
+  }
+}
+
+function decodeFocusedReadJson(result: GhExecResult, operation: string, target: ResourceTarget): unknown {
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new GhExecutionError(
+      "malformed_json",
+      `GitHub returned malformed JSON while ${operation} for ${describeTarget(target)}.`,
+    );
   }
 }
 
@@ -2302,6 +2389,152 @@ function projectRelease(
   return result;
 }
 
+function projectReleaseList(
+  raw: unknown,
+  target: Extract<ResourceTarget, { kind: "repository" }>,
+  page: number,
+  limit: number,
+  expanded: boolean,
+): Record<string, unknown> {
+  const source = focusedReadArray(raw, "listing releases", target);
+  const pageReleases = source.slice(0, limit);
+  pageReleases.forEach((release, index) => validateListedRelease(release, index, target));
+  const releases = pageReleases.map((release) => compactListedRelease(release, expanded, EXPANDED_RESOURCE_LIST_LIMIT));
+  const result: Record<string, unknown> = {
+    kind: "releases",
+    target: redactResourceTarget(target),
+    page,
+    limit,
+    releaseCount: releases.length,
+    releases,
+  };
+  if (expanded && pageReleases.some((release) => arrayValue(resourceRecord(release).assets).length > EXPANDED_RESOURCE_LIST_LIMIT)) {
+    return attachFullProjection(result, {
+      releases: pageReleases.map((release) => compactListedRelease(release, true, Number.MAX_SAFE_INTEGER)),
+    });
+  }
+  return result;
+}
+
+function projectIssueComments(
+  raw: unknown,
+  target: Extract<ResourceTarget, { kind: "issue" }>,
+  page: number,
+  limit: number,
+  expanded: boolean,
+): Record<string, unknown> {
+  const source = focusedReadArray(raw, "reading issue comments", target);
+  const pageComments = source.slice(0, limit);
+  pageComments.forEach((comment, index) => validateListedIssueComment(comment, index, target));
+  const comments = pageComments.map((comment) => compactListedIssueComment(comment, expanded));
+  return {
+    kind: "issue_comments",
+    target: redactResourceTarget(target),
+    page,
+    limit,
+    commentCount: comments.length,
+    comments,
+  };
+}
+
+function validateListedRelease(raw: unknown, index: number, target: ResourceTarget): void {
+  const value = resourceRecord(raw);
+  if (!nonEmptyString(value.tagName) && !nonEmptyString(value.tag_name)) {
+    throw new GhExecutionError(
+      "malformed_json",
+      `GitHub returned malformed JSON while listing releases for ${describeTarget(target)}: release ${index + 1} had no tag name.`,
+    );
+  }
+}
+
+function validateListedIssueComment(raw: unknown, index: number, target: ResourceTarget): void {
+  const value = resourceRecord(raw);
+  if (typeof value.id !== "number" || !Number.isFinite(value.id) || typeof value.body !== "string") {
+    throw new GhExecutionError(
+      "malformed_json",
+      `GitHub returned malformed JSON while reading issue comments for ${describeTarget(target)}: comment ${index + 1} had no numeric ID or body.`,
+    );
+  }
+}
+
+function focusedReadArray(raw: unknown, operation: string, target: ResourceTarget): unknown[] {
+  if (!Array.isArray(raw)) {
+    throw new GhExecutionError(
+      "malformed_json",
+      `GitHub returned malformed JSON while ${operation} for ${describeTarget(target)}: expected an array.`,
+    );
+  }
+  return raw;
+}
+
+function compactListedRelease(raw: unknown, expanded: boolean, assetLimit: number): Record<string, unknown> {
+  const value = resourceRecord(raw);
+  const assets = arrayValue(value.assets);
+  const release: Record<string, unknown> = {
+    ...mappedKnownFields(value, [
+      ["id"], ["name"], ["tagName", "tag_name"], ["publishedAt", "published_at"], ["createdAt", "created_at"],
+      ["updatedAt", "updated_at"], ["url", "html_url", "url"],
+    ]),
+    isDraft: Boolean(firstDefined(value, ["isDraft", "draft"])),
+    isPrerelease: Boolean(firstDefined(value, ["isPrerelease", "prerelease"])),
+    author: compactAccount(value.author ?? value.user),
+  };
+  if (expanded) {
+    Object.assign(release, {
+      ...mappedKnownFields(value, [
+        ["body"], ["targetCommitish", "target_commitish"],
+      ]),
+      isImmutable: Boolean(firstDefined(value, ["isImmutable", "immutable"])),
+      assetCount: assets.length,
+      assets: assets.slice(0, assetLimit).map(compactListedReleaseAsset),
+      assetsTruncated: assets.length > assetLimit,
+    });
+  }
+  return release;
+}
+
+function compactListedReleaseAsset(raw: unknown): Record<string, unknown> {
+  return mappedKnownFields(resourceRecord(raw), [
+    ["id"], ["name"], ["label"], ["size"], ["contentType", "content_type"], ["downloadCount", "download_count"],
+    ["createdAt", "created_at"], ["updatedAt", "updated_at"], ["state"], ["url"], ["downloadUrl", "browser_download_url", "download_url"],
+  ]);
+}
+
+function compactListedIssueComment(raw: unknown, expanded: boolean): Record<string, unknown> {
+  const value = resourceRecord(raw);
+  const comment: Record<string, unknown> = {
+    ...mappedKnownFields(value, [
+      ["id"], ["body"], ["createdAt", "created_at"], ["updatedAt", "updated_at"], ["url", "html_url", "url"],
+    ]),
+    author: compactAccount(value.author ?? value.user),
+  };
+  if (expanded) {
+    Object.assign(comment, mappedKnownFields(value, [
+      ["nodeId", "node_id"], ["authorAssociation", "author_association"], ["reactions"],
+    ]));
+  }
+  return comment;
+}
+
+function mappedKnownFields(
+  value: Record<string, unknown>,
+  fields: ReadonlyArray<readonly [string, ...string[]]>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [output, ...source] of fields) {
+    const found = firstDefined(value, source.length === 0 ? [output] : source);
+    if (found !== undefined) result[output] = redactUnknown(found);
+  }
+  return result;
+}
+
+function firstDefined(value: Record<string, unknown>, keys: readonly string[]): unknown {
+  for (const key of keys) {
+    if (value[key] !== undefined) return value[key];
+  }
+  return undefined;
+}
+
 function projectTree(
   value: Record<string, unknown>,
   target: Extract<ResourceTarget, { kind: "tree" }>,
@@ -2686,7 +2919,7 @@ function redactUnknown(value: unknown): unknown {
   if (typeof value === "string") return redactSecrets(value);
   if (Array.isArray(value)) return value.map(redactUnknown);
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, redactUnknown(nested)]));
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactSecrets(key), redactUnknown(nested)]));
   }
   return value;
 }

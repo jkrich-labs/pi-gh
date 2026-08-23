@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { estimateProjectionTokens } from "../extensions/gh/execute.ts";
 import { GhExecutionError } from "../extensions/gh/index.ts";
 import { createFakeExecutor, loadExtension, projectionOf, toolCtx } from "./helpers.ts";
 
@@ -133,4 +134,168 @@ test("content tools reject unsafe repository paths before invoking gh", async ()
     );
   }
   assert.equal(executor.calls.some((call) => call.argv[0] === "api"), false);
+});
+
+test("gh_list_releases returns bounded paged compact and expanded release projections", async () => {
+  const releases = [
+    {
+      id: 1,
+      name: "v2.0.0",
+      tag_name: "v2.0.0",
+      draft: false,
+      prerelease: false,
+      published_at: "2026-01-02T00:00:00Z",
+      created_at: "2026-01-01T00:00:00Z",
+      html_url: "https://github.com/cli/cli/releases/tag/v2.0.0",
+      author: { login: "maintainer" },
+      body: "Release notes ghp_exampleSecret",
+      target_commitish: "trunk",
+      immutable: false,
+      assets: [{ name: "cli.tgz", size: 12, content_type: "application/gzip", browser_download_url: "https://example.test/cli.tgz" }],
+    },
+    { id: 2, name: "v1.0.0", tag_name: "v1.0.0", draft: false, prerelease: false },
+  ];
+  const { executor, tool } = load("gh_list_releases", () => json(releases));
+  const compact = projectionOf(await tool.execute(
+    "releases-compact",
+    { repo: "cli/cli", limit: 1, page: 2 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  )) as Record<string, unknown>;
+  assert.equal(compact.kind, "releases");
+  assert.equal(compact.page, 2);
+  assert.equal(compact.limit, 1);
+  assert.equal(compact.releaseCount, 1);
+  assert.equal((compact.releases as Array<Record<string, unknown>>)[0]?.tagName, "v2.0.0");
+  assert.equal("body" in (compact.releases as Array<Record<string, unknown>>)[0]!, false);
+  const request = executor.calls.find((call) => call.argv[0] === "api");
+  assert.deepEqual(request?.argv, [
+    "api", "repos/cli/cli/releases", "--method", "GET", "--field", "per_page=1", "--field", "page=2",
+  ]);
+
+  const expanded = projectionOf(await tool.execute(
+    "releases-expanded",
+    { repo: "cli/cli", limit: 1, detail: "expanded" },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  )) as Record<string, unknown>;
+  const release = (expanded.releases as Array<Record<string, unknown>>)[0]!;
+  assert.equal(release.body, "Release notes [redacted]");
+  assert.deepEqual(release.assets, [{ name: "cli.tgz", size: 12, contentType: "application/gzip", downloadUrl: "https://example.test/cli.tgz" }]);
+});
+
+test("gh_list_releases reports malformed output with release context and keeps expanded output budgeted", async () => {
+  const malformed = load("gh_list_releases", () => ({ stdout: "{", stderr: "", code: 0, killed: false }));
+  await assert.rejects(
+    () => malformed.tool.execute("bad-releases", { repo: "cli/cli" }, undefined, undefined, toolCtx() as never),
+    (error: unknown) => error instanceof GhExecutionError
+      && error.category === "malformed_json"
+      && /listing releases.*cli\/cli/i.test(error.message),
+  );
+
+  const oversized = load("gh_list_releases", () => json([{
+    name: "v1", tag_name: "v1", body: "notes ".repeat(20_000), assets: [],
+  }]));
+  const result = await oversized.tool.execute(
+    "large-releases",
+    { repo: "cli/cli", detail: "expanded" },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const projection = projectionOf(result) as Record<string, unknown>;
+  assert.equal(projection.truncated, true);
+  assert.ok(estimateProjectionTokens(JSON.stringify(projection)) <= 8_000);
+});
+
+test("focused reads redact token-shaped resource targets from content and details", async () => {
+  const token = "ghp_exampleSecretTokenValue1234567890";
+  for (const [name, params] of [
+    ["gh_list_releases", { repo: `cli/${token}` }],
+    ["gh_issue_comments", { target: `cli/${token}#7` }],
+  ] as const) {
+    const { tool } = load(name, () => json([]));
+    const result = await tool.execute("redacted-target", params, undefined, undefined, toolCtx() as never) as {
+      content: Array<{ type: string; text?: string }>;
+      details?: unknown;
+    };
+    const serialized = JSON.stringify(result);
+    assert.doesNotMatch(serialized, /ghp_/);
+    assert.match(serialized, /\[redacted\]/);
+  }
+});
+
+test("expanded focused reads redact token-shaped object keys", async () => {
+  const token = "ghp_exampleSecretTokenValue1234567890";
+  const { tool } = load("gh_issue_comments", () => json([{
+    id: 10,
+    body: "safe",
+    reactions: { [token]: "value" },
+  }]));
+  const result = await tool.execute(
+    "redacted-key",
+    { target: "cli/cli#7", detail: "expanded" },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /ghp_/);
+  assert.match(serialized, /\[redacted\]/);
+});
+
+test("focused reads reject malformed array entries with resource context", async () => {
+  for (const [name, params, context] of [
+    ["gh_list_releases", { repo: "cli/cli" }, /listing releases.*cli\/cli/i],
+    ["gh_issue_comments", { target: "cli/cli#7" }, /issue comments.*cli\/cli issue #7/i],
+  ] as const) {
+    const { tool } = load(name, () => json([{}]));
+    await assert.rejects(
+      () => tool.execute("malformed-entry", params, undefined, undefined, toolCtx() as never),
+      (error: unknown) => error instanceof GhExecutionError
+        && error.category === "malformed_json"
+        && context.test(error.message),
+    );
+  }
+});
+
+test("gh_issue_comments returns bounded paged comments for an issue target", async () => {
+  const comments = [
+    {
+      id: 10,
+      body: "First ghp_exampleSecret",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T01:00:00Z",
+      html_url: "https://github.com/cli/cli/issues/7#issuecomment-10",
+      user: { login: "ada" },
+    },
+    { id: 11, body: "Second", user: { login: "lin" } },
+  ];
+  const { executor, tool } = load("gh_issue_comments", () => json(comments));
+  const result = await tool.execute(
+    "issue-comments",
+    { target: "https://github.com/cli/cli/issues/7", limit: 1, page: 3 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const projection = projectionOf(result) as Record<string, unknown>;
+  assert.equal(projection.kind, "issue_comments");
+  assert.equal(projection.page, 3);
+  assert.equal(projection.limit, 1);
+  assert.equal(projection.commentCount, 1);
+  assert.deepEqual(projection.comments, [{
+    id: 10,
+    body: "First [redacted]",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T01:00:00Z",
+    url: "https://github.com/cli/cli/issues/7#issuecomment-10",
+    author: { login: "ada" },
+  }]);
+  const request = executor.calls.find((call) => call.argv[0] === "api");
+  assert.deepEqual(request?.argv, [
+    "api", "repos/cli/cli/issues/7/comments", "--method", "GET", "--field", "per_page=1", "--field", "page=3",
+  ]);
 });
