@@ -96,11 +96,26 @@ export function scriptedExecutor(
   });
 }
 
-export function loadExtension(overrides: Partial<GhDependencies> = {}) {
+export function loadExtension(
+  overrides: Partial<GhDependencies> = {},
+  options: { activeTools?: string[] } = {},
+) {
   const tools = new Map<string, ToolDefinition>();
+  const activeTools = [...(options.activeTools ?? [])];
+  const activeChanges: string[][] = [];
   const pi = {
     registerTool(tool: ToolDefinition) {
       tools.set(tool.name, tool);
+    },
+    getActiveTools() {
+      return [...activeTools];
+    },
+    getAllTools() {
+      return [...tools.values()];
+    },
+    setActiveTools(names: string[]) {
+      activeTools.splice(0, activeTools.length, ...names);
+      activeChanges.push([...names]);
     },
     on() {},
     exec: async () => {
@@ -109,7 +124,7 @@ export function loadExtension(overrides: Partial<GhDependencies> = {}) {
   } as unknown as ExtensionAPI;
 
   createGhExtension(overrides)(pi);
-  return { tools, pi };
+  return { tools, pi, activeTools, activeChanges };
 }
 
 export function toolCtx(cwd = "/tmp/checkout") {

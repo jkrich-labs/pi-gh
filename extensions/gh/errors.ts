@@ -46,7 +46,7 @@ export function classifyGhFailure(
   if (signal?.aborted) return "aborted";
   if (result.killed) return "timeout";
   const text = `${result.stderr}\n${result.stdout}`;
-  if (result.code === 4 || /auth login|authentication required|bad credentials|HTTP 401/i.test(text)) {
+  if (result.code === 4 || /auth login|authentication required|not logged in|not authenticated|login required|bad credentials|HTTP 401/i.test(text)) {
     return "auth";
   }
   if (/could not resolve to a repository|HTTP 404|\bnot found\b/i.test(text)) return "not_found";

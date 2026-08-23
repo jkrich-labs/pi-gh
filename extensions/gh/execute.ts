@@ -5,7 +5,14 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import { formatRepositoryTarget, resolveResourceTarget } from "./targets.ts";
+import {
+  formatHost,
+  formatRepositoryTarget,
+  normalizeHost,
+  resolveResourceTarget,
+  type ResourceTarget,
+  type ViewResourceKind,
+} from "./targets.ts";
 
 export const MIN_GH_VERSION = "2.81.0";
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -13,6 +20,12 @@ export const DEFAULT_TOKEN_BUDGET = 2_000;
 export const EXPANDED_TOKEN_BUDGET = 8_000;
 export const REPO_VIEW_FIELDS =
   "name,nameWithOwner,description,url,visibility,isPrivate,isFork,isArchived,stargazerCount,forkCount,primaryLanguage,defaultBranchRef,updatedAt,createdAt,homepageUrl,licenseInfo,repositoryTopics,owner";
+
+const ISSUE_VIEW_FIELDS = "number,title,state,author,assignees,labels,createdAt,updatedAt,url";
+const PULL_REQUEST_VIEW_FIELDS = "number,title,state,isDraft,author,assignees,labels,baseRefName,headRefName,mergeStateStatus,createdAt,updatedAt,url";
+const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,isLatest,publishedAt,createdAt,url,author";
+const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,createdAt,updatedAt,url";
+const JOB_VIEW_FIELDS = "databaseId,name,status,conclusion,startedAt,completedAt,url,steps";
 
 export interface GhExecRequest {
   argv: string[];
@@ -65,7 +78,9 @@ export function createPiExecutor(pi: ExtensionAPI): GhExecutor {
 
 export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOutput }) {
   const tempOutput = deps.tempOutput ?? createSecureTempOutput();
+  const authenticatedHosts = new Set<string>(["github.com"]);
   let ready = false;
+  let hostsLoaded = false;
 
   async function ensureGh(signal?: AbortSignal): Promise<void> {
     if (ready) return;
@@ -96,6 +111,28 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     ready = true;
   }
 
+  async function ensureHost(host: string, signal?: AbortSignal): Promise<void> {
+    const normalized = normalizeHost(host);
+    if (authenticatedHosts.has(normalized)) return;
+    if (!hostsLoaded) {
+      const result = await run({ argv: ["auth", "status", "--json", "hosts"], signal, timeout: 10_000 });
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(result.stdout);
+      } catch {
+        throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
+      }
+      for (const host of extractAuthenticatedHosts(decoded)) authenticatedHosts.add(host);
+      hostsLoaded = true;
+    }
+    if (!authenticatedHosts.has(normalized)) {
+      throw new GhExecutionError(
+        "auth",
+        `GitHub host ${normalized} is not authenticated with gh. Authenticate it with gh auth login --hostname ${normalized}.`,
+      );
+    }
+  }
+
   async function run(request: GhExecRequest): Promise<GhExecResult> {
     throwIfAborted(request.signal);
     let result: GhExecResult;
@@ -124,18 +161,16 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
   }
 
   async function runView(
-    input: { target?: string; detail?: "compact" | "expanded" },
+    input: { target?: string; kind?: ViewResourceKind; detail?: "compact" | "expanded" },
     ctx: { cwd: string; signal?: AbortSignal },
-  ): Promise<{ projection: Record<string, unknown> }> {
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
     throwIfAborted(ctx.signal);
+    const target = resolveResourceTarget(input.target, { kind: input.kind });
     await ensureGh(ctx.signal);
-    const target = resolveResourceTarget(input.target);
-    const repository = formatRepositoryTarget(target);
-    const argv = repository
-      ? ["repo", "view", repository, "--json", REPO_VIEW_FIELDS]
-      : ["repo", "view", "--json", REPO_VIEW_FIELDS];
+    if (target.kind !== "current_checkout") await ensureHost(target.host, ctx.signal);
+
     const result = await run({
-      argv,
+      argv: buildViewArgv(target),
       cwd: ctx.cwd,
       signal: ctx.signal,
       timeout: DEFAULT_TIMEOUT_MS,
@@ -147,14 +182,63 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
     }
     const projection = await budgetProjection(
-      projectRepository(decoded),
+      projectResource(decoded, target),
       input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
       tempOutput,
     );
-    return { projection };
+    return { projection, target };
   }
 
-  return { runView };
+  return { runView, ensureHost };
+}
+
+export function buildViewArgv(target: ResourceTarget): string[] {
+  if (target.kind === "repository" || target.kind === "current_checkout") {
+    return [
+      "repo",
+      "view",
+      ...(target.kind === "repository" ? [cliRepositoryTarget(target)] : []),
+      "--json",
+      REPO_VIEW_FIELDS,
+    ];
+  }
+
+  const repository = formatRepositoryTarget(target)!;
+  const cliRepository = cliRepositoryTarget(target);
+  switch (target.kind) {
+    case "issue":
+      return ["issue", "view", String(target.number), "--repo", cliRepository, "--json", ISSUE_VIEW_FIELDS];
+    case "pull_request":
+      return ["pr", "view", String(target.number), "--repo", cliRepository, "--json", PULL_REQUEST_VIEW_FIELDS];
+    case "commit":
+      return ["api", ...hostnameArgs(target), `repos/${repository}/commits/${encodeURIComponent(target.sha)}`];
+    case "release":
+      return ["release", "view", target.tag, "--repo", cliRepository, "--json", RELEASE_VIEW_FIELDS];
+    case "workflow_run":
+      return ["run", "view", String(target.runId), "--repo", cliRepository, "--json", RUN_VIEW_FIELDS];
+    case "job":
+      return ["run", "view", String(target.runId), "--job", String(target.jobId), "--repo", cliRepository, "--json", JOB_VIEW_FIELDS];
+    case "file":
+      return [
+        "api",
+        ...hostnameArgs(target),
+        `repos/${repository}/contents/${target.path.split("/").map(encodeURIComponent).join("/")}`,
+        "--method",
+        "GET",
+        "--field",
+        `ref=${target.ref}`,
+      ];
+    case "tree":
+      return [
+        "api",
+        ...hostnameArgs(target),
+        `repos/${repository}/git/trees/${encodeURIComponent(target.ref)}${target.path ? `?path=${encodeURIComponent(target.path)}` : ""}`,
+      ];
+    case "compare":
+      return ["api", ...hostnameArgs(target), `repos/${repository}/compare/${target.base}...${target.head}`];
+    default:
+      return assertNever(target);
+  }
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {
@@ -182,6 +266,16 @@ export function projectRepository(raw: unknown): Record<string, unknown> {
     createdAt: asString(value.createdAt),
     updatedAt: asString(value.updatedAt),
     owner: ownerLogin(value.owner),
+  };
+}
+
+export function projectResource(raw: unknown, target: ResourceTarget): Record<string, unknown> {
+  if (target.kind === "repository" || target.kind === "current_checkout") return projectRepository(raw);
+  const targetProjection = { ...target };
+  return {
+    kind: target.kind,
+    target: targetProjection,
+    data: redactUnknown(raw),
   };
 }
 
@@ -226,6 +320,26 @@ async function budgetProjection(
     tokenBudget: budget,
     fullPath: path,
   };
+}
+
+function hostnameArgs(target: ResourceTarget): string[] {
+  const host = formatHost(target);
+  return host ? ["--hostname", host] : [];
+}
+
+function cliRepositoryTarget(target: ResourceTarget): string {
+  const repository = formatRepositoryTarget(target);
+  if (!repository) throw new Error("A current checkout has no explicit CLI repository target.");
+  const host = formatHost(target);
+  return host ? `${host}/${repository}` : repository;
+}
+
+function extractAuthenticatedHosts(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const hosts = (value as { hosts?: unknown }).hosts;
+  if (Array.isArray(hosts)) return hosts.filter((host): host is string => typeof host === "string").map(normalizeHost);
+  if (!hosts || typeof hosts !== "object") return [];
+  return Object.keys(hosts).map(normalizeHost);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -277,4 +391,17 @@ function topicNames(value: unknown): string[] {
     const name = nestedName(entry);
     return name ? [name] : [];
   });
+}
+
+function redactUnknown(value: unknown): unknown {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactUnknown);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, redactUnknown(nested)]));
+  }
+  return value;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled GitHub resource target: ${JSON.stringify(value)}`);
 }
