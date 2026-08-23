@@ -35,6 +35,29 @@ test("API GET projections stay within compact and expanded result budgets", asyn
   }
 });
 
+test("resource view compact and expanded projections stay within their result budgets", async () => {
+  const payload = {
+    number: 7,
+    title: "Large issue",
+    state: "OPEN",
+    body: "Issue body ".repeat(10_000),
+    comments: Array.from({ length: 50 }, (_, index) => ({ body: `Comment ${index} `.repeat(500), author: { login: `user-${index}` } })),
+  };
+  const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+    ? { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false }
+    : { stdout: JSON.stringify(payload), stderr: "", code: 0, killed: false });
+  const loaded = loadExtension({ executor: executor.execute });
+  const tool = loaded.tools.get("gh_view");
+  assert.ok(tool);
+  for (const [detail, budget] of [["compact", 2_000], ["expanded", 8_000]] as const) {
+    const projection = projectionOf(
+      await tool.execute("view-budget", { target: "https://github.com/cli/cli/issues/7", detail }, undefined, undefined, toolCtx() as never),
+    ) as Record<string, unknown>;
+    assert.ok(estimateProjectionTokens(JSON.stringify(projection)) <= budget);
+    assert.equal("body" in projection, detail === "expanded" && !projection.truncated);
+  }
+});
+
 test("CI projections stay within compact and expanded result budgets", async () => {
   const runs = Array.from({ length: 50 }, (_, index) => ({
     databaseId: index,

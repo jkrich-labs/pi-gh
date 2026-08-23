@@ -176,7 +176,9 @@ test("gh_view truncates an oversized repository projection", async () => {
   assert.equal(projection.truncated, true);
   assert.equal(projection.fullPath, "/tmp/pi-gh/opaque");
   assert.equal(projection.nameWithOwner, "cli/cli");
-  assert.equal(projection.omittedCount, 17);
+  assert.equal(projection.stars, REPO_VIEW_JSON.stargazerCount);
+  assert.equal(projection.forks, REPO_VIEW_JSON.forkCount);
+  assert.equal(projection.omittedCount, 15);
   assert.ok((projection.tokenCount as number) > (projection.tokenBudget as number));
   assert.ok(writes[0]?.includes(description));
 });

@@ -38,8 +38,11 @@ export const REPO_VIEW_FIELDS =
   "name,nameWithOwner,description,url,visibility,isPrivate,isFork,isArchived,stargazerCount,forkCount,primaryLanguage,defaultBranchRef,updatedAt,createdAt,homepageUrl,licenseInfo,repositoryTopics,owner";
 
 const ISSUE_VIEW_FIELDS = "number,title,state,author,assignees,labels,createdAt,updatedAt,url";
+const ISSUE_VIEW_EXPANDED_FIELDS = "body,closedAt,stateReason,milestone,comments";
 const PULL_REQUEST_VIEW_FIELDS = "number,title,state,isDraft,author,assignees,labels,baseRefName,headRefName,mergeStateStatus,createdAt,updatedAt,url";
+const PULL_REQUEST_VIEW_EXPANDED_FIELDS = "body,closedAt,mergedAt,mergedBy,mergeCommit,reviewDecision,changedFiles,additions,deletions,milestone,comments,commits,files,reviews,statusCheckRollup";
 const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,publishedAt,createdAt,url,author";
+const RELEASE_VIEW_EXPANDED_FIELDS = "body,targetCommitish,isImmutable,assets";
 const RELEASE_VIEW_FIELDS_EXTRA = ["isLatest"];
 const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,createdAt,updatedAt,url";
 const RUN_VIEW_FIELDS_EXTRA = ["workflowDatabaseId"];
@@ -185,10 +188,38 @@ export function createSecureTempOutput(): TempOutput {
       const dir = await mkdtemp(join(tmpdir(), "pi-gh-"));
       await chmod(dir, 0o700);
       const path = join(dir, randomBytes(16).toString("hex"));
-      await writeFile(path, redactSecrets(content), { mode: 0o600, flag: "wx" });
+      await writeFile(path, formatTempOutput(content), { mode: 0o600, flag: "wx" });
       return { path };
     },
   };
+}
+
+function formatTempOutput(content: string): string {
+  try {
+    // Redact individual JSON keys and values before serialization: applying a
+    // text replacement to the serialized form can consume JSON delimiters.
+    return `${JSON.stringify(redactSpillJson(JSON.parse(content)), null, 2)}\n`;
+  } catch {
+    return redactSecrets(content);
+  }
+}
+
+function redactSpillJson(value: unknown): unknown {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactSpillJson);
+  if (value && typeof value === "object") {
+    const redacted: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) {
+      const baseKey = redactSecrets(key);
+      let outputKey = baseKey;
+      for (let suffix = 2; Object.hasOwn(redacted, outputKey); suffix += 1) {
+        outputKey = `${baseKey}#${suffix}`;
+      }
+      redacted[outputKey] = redactSpillJson(nested);
+    }
+    return redacted;
+  }
+  return value;
 }
 
 export function createPiExecutor(pi: ExtensionAPI): GhExecutor {
@@ -305,7 +336,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     await ensureGh(ctx.signal);
     if (target.kind !== "current_checkout") await ensureHost(target.host, ctx.signal);
 
-    let argv = buildViewArgv(target);
+    let argv = buildViewArgv(target, input.detail);
     /* First attempt is wrapped so gh 2.81.0's `Unknown JSON field` failure can
      * drive field removal instead of surfacing as a hard error. */
     let raw: GhExecResult;
@@ -355,7 +386,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     const projection = await budgetProjection(
       target.kind === "file"
         ? projectFile(decoded, target, target.path, target.ref)
-        : projectResource(decoded, target),
+        : projectResource(decoded, target, input.detail === "expanded"),
       input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
       tempOutput,
     );
@@ -635,7 +666,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
   return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, runApiGet, ensureHost };
 }
 
-export function buildViewArgv(target: ResourceTarget): string[] {
+export function buildViewArgv(target: ResourceTarget, detail: "compact" | "expanded" = "compact"): string[] {
   if (target.kind === "repository" || target.kind === "current_checkout") {
     return [
       "repo",
@@ -650,13 +681,13 @@ export function buildViewArgv(target: ResourceTarget): string[] {
   const cliRepository = cliRepositoryTarget(target);
   switch (target.kind) {
     case "issue":
-      return ["issue", "view", String(target.number), "--repo", cliRepository, "--json", ISSUE_VIEW_FIELDS];
+      return ["issue", "view", String(target.number), "--repo", cliRepository, "--json", joinViewFields(ISSUE_VIEW_FIELDS, detail === "expanded" ? ISSUE_VIEW_EXPANDED_FIELDS : undefined)];
     case "pull_request":
-      return ["pr", "view", String(target.number), "--repo", cliRepository, "--json", PULL_REQUEST_VIEW_FIELDS];
+      return ["pr", "view", String(target.number), "--repo", cliRepository, "--json", joinViewFields(PULL_REQUEST_VIEW_FIELDS, detail === "expanded" ? PULL_REQUEST_VIEW_EXPANDED_FIELDS : undefined)];
     case "commit":
       return ["api", ...hostnameArgs(target), `repos/${repository}/commits/${encodeURIComponent(target.sha)}`];
     case "release":
-      return ["release", "view", target.tag, "--repo", cliRepository, "--json", RELEASE_VIEW_FIELDS];
+      return ["release", "view", target.tag, "--repo", cliRepository, "--json", joinViewFields(RELEASE_VIEW_FIELDS, detail === "expanded" ? RELEASE_VIEW_EXPANDED_FIELDS : undefined)];
     case "workflow_run":
       return ["run", "view", String(target.runId), "--repo", cliRepository, "--json", RUN_VIEW_FIELDS];
     case "job":
@@ -675,13 +706,17 @@ export function buildViewArgv(target: ResourceTarget): string[] {
       return [
         "api",
         ...hostnameArgs(target),
-        `repos/${repository}/git/trees/${encodeURIComponent(target.ref)}${target.path ? `?path=${encodeURIComponent(target.path)}` : ""}`,
+        `repos/${repository}/git/trees/${encodeURIComponent(target.ref)}?recursive=1`,
       ];
     case "compare":
-      return ["api", ...hostnameArgs(target), `repos/${repository}/compare/${target.base}...${target.head}`];
+      return ["api", ...hostnameArgs(target), `repos/${repository}/compare/${encodeURIComponent(target.base)}...${encodeURIComponent(target.head)}`];
     default:
       return assertNever(target);
   }
+}
+
+function joinViewFields(base: string, extra: string | undefined): string {
+  return extra ? `${base},${extra}` : base;
 }
 
 function resolveRepositoryTarget(raw: string): Extract<ResourceTarget, { kind: "repository" }> {
@@ -807,26 +842,59 @@ function projectFile(raw: unknown, target: ResourceTarget, path: string, ref: st
   /* Base64 content is fully decoded, mirroring gh_read_file: the contents
    * endpoint always wraps text files in base64 (report issue). */
   const base = { kind: "file", target, path, ref: ref ?? null };
-  if (typeof raw === "string") return { ...base, binary: false, encoding: "utf-8", byteCount: Buffer.byteLength(raw), content: raw };
-  if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub file JSON was not an object.");
+  const context = `GitHub file contents JSON for ${redactSecrets(path)}`;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).length === 0) {
+    throw new GhExecutionError("malformed_json", `${context} was not a non-empty object.`);
+  }
   const value = raw as Record<string, unknown>;
+  if (value.type !== "file") {
+    throw new GhExecutionError("malformed_json", `${context} did not describe a file.`);
+  }
+  if (typeof value.content !== "string") {
+    throw new GhExecutionError("malformed_json", `${context} was missing file content.`);
+  }
   const encoding = typeof value.encoding === "string" ? value.encoding : undefined;
-  const content = typeof value.content === "string" ? value.content.replace(/\s/g, "") : undefined;
-  if (encoding === "base64" && content !== undefined) {
+  const content = encoding === "base64" ? value.content.replace(/\r?\n/g, "") : value.content;
+  if (encoding === "base64") {
+    if (/[^A-Za-z0-9+/=\r\n]/.test(value.content) || !isCanonicalBase64(content)) {
+      throw new GhExecutionError("malformed_json", `${context} contained invalid base64 file content.`);
+    }
     const bytes = Buffer.from(content, "base64");
     const decoded = decodeUtf8(bytes);
     if (decoded !== undefined && !decoded.includes("\u0000")) {
-      return { ...base, binary: false, encoding: "utf-8", byteCount: bytes.length, content: decoded };
+      return { ...base, binary: false, encoding: "utf-8", byteCount: bytes.length, content: redactSecrets(decoded) };
     }
-    return { ...base, binary: true, encoding: "base64", byteCount: bytes.length, contentBase64: content };
+    return {
+      ...base,
+      binary: true,
+      encoding: "base64",
+      byteCount: bytes.length,
+      ...fileMetadata(value),
+    };
   }
   return {
     ...base,
     binary: false,
     encoding: encoding ?? "utf-8",
-    byteCount: typeof value.size === "number" ? value.size : 0,
-    content: typeof value.content === "string" ? value.content : null,
+    byteCount: typeof value.size === "number" ? value.size : Buffer.byteLength(value.content),
+    content: redactSecrets(value.content),
   };
+}
+
+function isCanonicalBase64(value: string): boolean {
+  if (value.length === 0) return true;
+  if (value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return false;
+  }
+  return Buffer.from(value, "base64").toString("base64") === value;
+}
+
+function fileMetadata(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    ["name", "path", "sha", "size", "url", "html_url", "download_url", "git_url"]
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, redactUnknown(value[key])]),
+  );
 }
 
 function projectDirectory(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined, limit: number): Record<string, unknown> {
@@ -1699,10 +1767,10 @@ async function runChecks(
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {
-  if (!raw || typeof raw !== "object") {
-    throw new GhExecutionError("malformed_json", "gh repository JSON was not an object.");
+  const value = requiredResourceRecord(raw, "gh repository");
+  if (!nonEmptyString(value.name) || !nonEmptyString(value.nameWithOwner)) {
+    throw new GhExecutionError("malformed_json", "gh repository JSON was missing its repository identity.");
   }
-  const value = raw as Record<string, unknown>;
   return {
     kind: "repository",
     name: asString(value.name),
@@ -1726,39 +1794,488 @@ export function projectRepository(raw: unknown): Record<string, unknown> {
   };
 }
 
-export function projectResource(raw: unknown, target: ResourceTarget): Record<string, unknown> {
+export function projectResource(raw: unknown, target: ResourceTarget, expanded = false): Record<string, unknown> {
   if (target.kind === "repository" || target.kind === "current_checkout") return projectRepository(raw);
-  const targetProjection = { ...target };
-  if (target.kind === "tree") {
-    const filtered = filterTreeToPath(raw, target.path);
-    return {
-      kind: target.kind,
-      target: targetProjection,
-      ...(target.path ? { note: "The trees endpoint ignores ?path; entries below were filtered locally." } : {}),
-      data: redactUnknown(filtered),
-    };
+  const value = requiredResourceRecord(raw, `GitHub ${target.kind}`);
+  assertResourceShape(value, target);
+  switch (target.kind) {
+    case "issue":
+      return projectIssue(value, target, expanded);
+    case "pull_request":
+      return projectPullRequest(value, target, expanded);
+    case "commit":
+      return projectCommit(value, target, expanded);
+    case "compare":
+      return projectCompare(value, target, expanded);
+    case "release":
+      return projectRelease(value, target, expanded);
+    case "tree":
+      return projectTree(value, target, expanded);
+    case "workflow_run":
+    case "job":
+      return { kind: target.kind, target: { ...target }, data: redactUnknown(raw) };
+    case "file":
+      throw new GhExecutionError("validation", "File views must use the file projector.");
+    default:
+      return assertNever(target);
   }
+}
+
+const COMPACT_RESOURCE_LIST_LIMIT = 10;
+const EXPANDED_RESOURCE_LIST_LIMIT = 25;
+const FULL_PROJECTION = Symbol("pi-gh.full-projection");
+type SpillAwareProjection = Record<string, unknown> & { [FULL_PROJECTION]?: Record<string, unknown> };
+
+function attachFullProjection(
+  visible: Record<string, unknown>,
+  fullOverrides: Record<string, unknown>,
+): Record<string, unknown> {
+  Object.defineProperty(visible, FULL_PROJECTION, {
+    value: { ...visible, ...fullOverrides },
+    enumerable: false,
+  });
+  return visible;
+}
+
+function requiredResourceRecord(raw: unknown, description: string): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).length === 0) {
+    throw new GhExecutionError("malformed_json", `${description} JSON was not a non-empty object.`);
+  }
+  return raw as Record<string, unknown>;
+}
+
+function assertResourceShape(value: Record<string, unknown>, target: Exclude<ResourceTarget, { kind: "repository" | "current_checkout" }>): void {
+  const malformed = (expectation: string): never => {
+    throw new GhExecutionError("malformed_json", `GitHub ${target.kind} JSON was missing ${expectation}.`);
+  };
+  switch (target.kind) {
+    case "issue":
+    case "pull_request":
+      if (!positiveFiniteNumber(value.number) || value.number !== target.number || !nonEmptyString(value.title) || !nonEmptyString(value.state)) {
+        malformed("its number, title, or state");
+      }
+      return;
+    case "commit":
+      if (!nonEmptyString(value.sha) || !resourceRecord(value.commit) || !nonEmptyString(resourceRecord(value.commit).message)) {
+        malformed("its SHA or commit message");
+      }
+      return;
+    case "compare":
+      if (!nonEmptyString(value.status) || !nonEmptyString(resourceRecord(value.base_commit).sha) || !Array.isArray(value.commits) || !Array.isArray(value.files)) {
+        malformed("its comparison status, base commit, commits, or files");
+      }
+      return;
+    case "release":
+      if (!nonEmptyString(value.tagName)) malformed("its tag name");
+      return;
+    case "tree":
+      if (!Array.isArray(value.tree)) malformed("its tree entries");
+      return;
+    case "workflow_run":
+    case "job":
+      if (!positiveFiniteNumber(value.databaseId)) malformed("its database ID");
+      return;
+    case "file":
+      return;
+    default:
+      return assertNever(target);
+  }
+}
+
+function resourceRecord(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function positiveFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function projectIssue(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "issue" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const comments = arrayValue(value.comments);
+  const result: Record<string, unknown> = {
+    kind: "issue",
+    target: { ...target },
+    number: numberOr(value.number, target.number),
+    title: asString(value.title),
+    state: asString(value.state),
+    author: compactAccount(value.author),
+    assignees: compactAccounts(value.assignees),
+    labels: compactLabels(value.labels),
+    createdAt: asString(value.createdAt),
+    updatedAt: asString(value.updatedAt),
+    url: asString(value.url),
+  };
+  if (expanded) {
+    Object.assign(result, {
+      body: asString(value.body),
+      closedAt: asString(value.closedAt),
+      stateReason: asString(value.stateReason),
+      milestone: compactMilestone(value.milestone),
+      commentCount: comments.length,
+      comments: comments.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactIssueComment),
+      commentsTruncated: comments.length > EXPANDED_RESOURCE_LIST_LIMIT,
+    });
+    if (comments.length > EXPANDED_RESOURCE_LIST_LIMIT) {
+      return attachFullProjection(result, {
+        comments: comments.map(compactIssueComment),
+        commentsTruncated: false,
+      });
+    }
+  }
+  return result;
+}
+
+function projectPullRequest(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "pull_request" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const comments = arrayValue(value.comments);
+  const commits = arrayValue(value.commits);
+  const files = arrayValue(value.files);
+  const reviews = arrayValue(value.reviews);
+  const statusChecks = arrayValue(value.statusCheckRollup);
+  const result: Record<string, unknown> = {
+    kind: "pull_request",
+    target: { ...target },
+    number: numberOr(value.number, target.number),
+    title: asString(value.title),
+    state: asString(value.state),
+    isDraft: Boolean(value.isDraft),
+    author: compactAccount(value.author),
+    assignees: compactAccounts(value.assignees),
+    labels: compactLabels(value.labels),
+    baseRefName: asString(value.baseRefName),
+    headRefName: asString(value.headRefName),
+    mergeStateStatus: asString(value.mergeStateStatus),
+    createdAt: asString(value.createdAt),
+    updatedAt: asString(value.updatedAt),
+    url: asString(value.url),
+  };
+  if (expanded) {
+    Object.assign(result, {
+      body: asString(value.body),
+      closedAt: asString(value.closedAt),
+      mergedAt: asString(value.mergedAt),
+      mergedBy: compactAccount(value.mergedBy),
+      mergeCommit: compactCommitReference(value.mergeCommit),
+      reviewDecision: asString(value.reviewDecision),
+      changedFiles: asNumber(value.changedFiles),
+      additions: asNumber(value.additions),
+      deletions: asNumber(value.deletions),
+      milestone: compactMilestone(value.milestone),
+      commentCount: comments.length,
+      comments: comments.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactIssueComment),
+      commitCount: commits.length,
+      commits: compactCommitReferences(commits, EXPANDED_RESOURCE_LIST_LIMIT),
+      fileCount: files.length,
+      files: files.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactComparisonFile),
+      reviewCount: reviews.length,
+      reviews: reviews.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactReview),
+      statusCheckCount: statusChecks.length,
+      statusChecks: compactStatusChecks(statusChecks, EXPANDED_RESOURCE_LIST_LIMIT),
+      statusChecksTruncated: statusChecks.length > EXPANDED_RESOURCE_LIST_LIMIT,
+      listsTruncated: [comments, commits, files, reviews, statusChecks].some((list) => list.length > EXPANDED_RESOURCE_LIST_LIMIT),
+    });
+    if (result.listsTruncated === true) {
+      return attachFullProjection(result, {
+        comments: comments.map(compactIssueComment),
+        commits: compactCommitReferences(commits, commits.length),
+        files: files.map(compactComparisonFile),
+        reviews: reviews.map(compactReview),
+        statusChecks: compactStatusChecks(statusChecks, statusChecks.length),
+        statusChecksTruncated: false,
+        listsTruncated: false,
+      });
+    }
+  }
+  return result;
+}
+
+function projectCommit(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "commit" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const commit = resourceRecord(value.commit);
+  const files = arrayValue(value.files);
+  const result: Record<string, unknown> = {
+    kind: "commit",
+    target: { ...target },
+    sha: asString(value.sha) ?? target.sha,
+    url: asString(value.html_url) ?? asString(value.url),
+    message: asString(commit.message),
+    author: compactCommitPerson(value.author, commit.author),
+    committer: compactCommitPerson(value.committer, commit.committer),
+    parentShas: arrayValue(value.parents).flatMap((parent) => {
+      const sha = asString(resourceRecord(parent).sha);
+      return sha ? [sha] : [];
+    }),
+    stats: compactStats(value.stats),
+  };
+  if (expanded) {
+    Object.assign(result, {
+      verification: compactVerification(commit.verification),
+      fileCount: files.length,
+      files: files.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactComparisonFile),
+      filesTruncated: files.length > EXPANDED_RESOURCE_LIST_LIMIT,
+    });
+    if (files.length > EXPANDED_RESOURCE_LIST_LIMIT) {
+      return attachFullProjection(result, {
+        files: files.map(compactComparisonFile),
+        filesTruncated: false,
+      });
+    }
+  }
+  return result;
+}
+
+function projectCompare(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "compare" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const commits = arrayValue(value.commits);
+  const files = arrayValue(value.files);
+  const limit = expanded ? EXPANDED_RESOURCE_LIST_LIMIT : COMPACT_RESOURCE_LIST_LIMIT;
+  const result: Record<string, unknown> = {
+    kind: "compare",
+    target: { ...target },
+    url: asString(value.html_url) ?? asString(value.url),
+    status: asString(value.status),
+    aheadBy: asNumber(value.ahead_by),
+    behindBy: asNumber(value.behind_by),
+    totalCommits: asNumber(value.total_commits),
+    baseSha: asString(resourceRecord(value.base_commit).sha) ?? target.base,
+    mergeBaseSha: asString(resourceRecord(value.merge_base_commit).sha),
+    commitCount: commits.length,
+    commits: compactCommitReferences(commits, limit),
+    fileCount: files.length,
+    files: files.slice(0, limit).map(compactComparisonFile),
+    listsTruncated: commits.length > limit || files.length > limit,
+  };
+  if (result.listsTruncated === true) {
+    return attachFullProjection(result, {
+      commits: compactCommitReferences(commits, commits.length),
+      files: files.map(compactComparisonFile),
+      listsTruncated: false,
+    });
+  }
+  return result;
+}
+
+function projectRelease(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "release" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const assets = arrayValue(value.assets);
+  const result: Record<string, unknown> = {
+    kind: "release",
+    target: { ...target },
+    name: asString(value.name),
+    tagName: asString(value.tagName) ?? target.tag,
+    isDraft: Boolean(value.isDraft),
+    isPrerelease: Boolean(value.isPrerelease),
+    publishedAt: asString(value.publishedAt),
+    createdAt: asString(value.createdAt),
+    url: asString(value.url),
+    author: compactAccount(value.author),
+  };
+  if (expanded) {
+    Object.assign(result, {
+      body: asString(value.body),
+      targetCommitish: asString(value.targetCommitish),
+      isImmutable: Boolean(value.isImmutable),
+      assetCount: assets.length,
+      assets: assets.slice(0, EXPANDED_RESOURCE_LIST_LIMIT).map(compactReleaseAsset),
+      assetsTruncated: assets.length > EXPANDED_RESOURCE_LIST_LIMIT,
+    });
+    if (assets.length > EXPANDED_RESOURCE_LIST_LIMIT) {
+      return attachFullProjection(result, {
+        assets: assets.map(compactReleaseAsset),
+        assetsTruncated: false,
+      });
+    }
+  }
+  return result;
+}
+
+function projectTree(
+  value: Record<string, unknown>,
+  target: Extract<ResourceTarget, { kind: "tree" }>,
+  expanded: boolean,
+): Record<string, unknown> {
+  const allEntries = arrayValue(value.tree);
+  const matchingEntries = filterTreeEntries(allEntries, target.path);
+  const limit = expanded ? EXPANDED_RESOURCE_LIST_LIMIT : COMPACT_RESOURCE_LIST_LIMIT;
+  const sourceTruncated = value.truncated === true;
+  const result: Record<string, unknown> = {
+    kind: "tree",
+    target: { ...target },
+    ref: target.ref,
+    path: target.path ?? null,
+    sha: asString(value.sha),
+    url: asString(value.url),
+    sourceTruncated,
+    ...(sourceTruncated
+      ? {
+          returnedEntryCount: allEntries.length,
+          returnedMatchingEntryCount: matchingEntries.length,
+        }
+      : {
+          totalEntryCount: allEntries.length,
+          matchingEntryCount: matchingEntries.length,
+        }),
+    entryCount: Math.min(matchingEntries.length, limit),
+    entries: matchingEntries.slice(0, limit).map(compactTreeEntry),
+    entriesTruncated: matchingEntries.length > limit,
+    ...(sourceTruncated ? { note: "GitHub returned a partial recursive tree; some entries may be missing." } : {}),
+  };
+  if (matchingEntries.length > limit) {
+    return attachFullProjection(result, {
+      entryCount: matchingEntries.length,
+      entries: matchingEntries.map(compactTreeEntry),
+      entriesTruncated: false,
+    });
+  }
+  return result;
+}
+
+function filterTreeEntries(entries: unknown[], path: string | undefined): unknown[] {
+  if (!path) return entries;
+  const prefix = path.endsWith("/") ? path : `${path}/`;
+  return entries.filter((entry) => {
+    const entryPath = asString(resourceRecord(entry).path);
+    return Boolean(entryPath?.startsWith(prefix));
+  });
+}
+
+function compactTreeEntry(raw: unknown): Record<string, unknown> {
+  return pickKnownFields(resourceRecord(raw), ["path", "mode", "type", "sha", "size", "url"]);
+}
+
+function compactComparisonFile(raw: unknown): Record<string, unknown> {
+  return pickKnownFields(resourceRecord(raw), ["filename", "path", "status", "additions", "deletions", "changes", "sha", "previous_filename"]);
+}
+
+function compactReleaseAsset(raw: unknown): Record<string, unknown> {
+  return pickKnownFields(resourceRecord(raw), ["name", "label", "size", "contentType", "downloadCount", "createdAt", "updatedAt", "state", "url", "downloadUrl"]);
+}
+
+function compactIssueComment(raw: unknown): Record<string, unknown> {
+  const value = resourceRecord(raw);
   return {
-    kind: target.kind,
-    target: targetProjection,
-    data: redactUnknown(raw),
+    ...pickKnownFields(value, ["id", "body", "createdAt", "updatedAt", "url"]),
+    author: compactAccount(value.author),
   };
 }
 
-/** Filters a Git-trees response ({ tree: [...] }) to a directory prefix. */
-function filterTreeToPath(raw: unknown, path: string | undefined): unknown {
-  if (!path || !raw || typeof raw !== "object") return raw;
-  const value = raw as Record<string, unknown>;
-  if (!Array.isArray(value.tree)) return raw;
-  const prefix = path.endsWith("/") ? path : `${path}/`;
+function compactReview(raw: unknown): Record<string, unknown> {
+  const value = resourceRecord(raw);
   return {
-    ...value,
-    tree: value.tree.filter((entry) =>
-      entry && typeof entry === "object" && typeof (entry as Record<string, unknown>).path === "string"
-        ? ((entry as Record<string, unknown>).path as string).startsWith(prefix)
-        : false,
-    ),
+    ...pickKnownFields(value, ["id", "body", "state", "submittedAt", "url"]),
+    author: compactAccount(value.author),
   };
+}
+
+function compactCommitReferences(entries: unknown[], limit: number): Array<Record<string, unknown>> {
+  return entries.slice(0, limit).flatMap((entry) => {
+    const commit = compactCommitReference(entry);
+    return commit ? [commit] : [];
+  });
+}
+
+function compactCommitReference(raw: unknown): Record<string, unknown> | null {
+  const value = resourceRecord(raw);
+  const commit = resourceRecord(value.commit);
+  const sha = asString(value.sha) ?? asString(value.oid);
+  if (!sha && Object.keys(value).length === 0) return null;
+  return {
+    sha,
+    url: asString(value.html_url) ?? asString(value.url),
+    message: asString(commit.message) ?? asString(value.messageHeadline),
+    author: compactCommitPerson(value.author, commit.author),
+  };
+}
+
+function compactCommitPerson(account: unknown, signature: unknown): Record<string, unknown> | null {
+  const accountValue = resourceRecord(account);
+  const signatureValue = resourceRecord(signature);
+  const result: Record<string, unknown> = {};
+  const login = asString(accountValue.login);
+  const name = asString(signatureValue.name);
+  const date = asString(signatureValue.date);
+  if (login) result.login = login;
+  if (name) result.name = name;
+  if (date) result.date = date;
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function compactAccount(raw: unknown): Record<string, unknown> | null {
+  const value = resourceRecord(raw);
+  if (typeof raw === "string") return { login: redactSecrets(raw) };
+  const result = pickKnownFields(value, ["login", "name", "url"]);
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function compactAccounts(raw: unknown): Array<Record<string, unknown>> {
+  return arrayValue(raw).flatMap((entry) => {
+    const account = compactAccount(entry);
+    return account ? [account] : [];
+  });
+}
+
+function compactLabels(raw: unknown): Array<Record<string, unknown>> {
+  return arrayValue(raw).map((entry) => pickKnownFields(resourceRecord(entry), ["name", "color", "description"]));
+}
+
+function compactMilestone(raw: unknown): Record<string, unknown> | null {
+  const value = resourceRecord(raw);
+  const milestone = pickKnownFields(value, ["title", "description", "dueOn", "url", "state"]);
+  return Object.keys(milestone).length > 0 ? milestone : null;
+}
+
+function compactStats(raw: unknown): Record<string, number> {
+  const value = resourceRecord(raw);
+  return { total: asNumber(value.total), additions: asNumber(value.additions), deletions: asNumber(value.deletions) };
+}
+
+function compactVerification(raw: unknown): Record<string, unknown> | null {
+  const value = resourceRecord(raw);
+  const verification = pickKnownFields(value, ["verified", "reason", "verified_at"]);
+  return Object.keys(verification).length > 0 ? verification : null;
+}
+
+function compactStatusChecks(entries: unknown[], limit: number): Array<Record<string, unknown>> {
+  // statusCheckRollup is a GraphQL union: StatusContext uses context/state/
+  // targetUrl rather than the CheckRun name/status/detailsUrl shape.
+  return entries.slice(0, limit).map((entry) => pickKnownFields(resourceRecord(entry), [
+    "__typename", "name", "context", "status", "state", "conclusion",
+    "detailsUrl", "targetUrl", "workflowName", "startedAt", "completedAt", "createdAt", "description",
+  ]));
+}
+
+function pickKnownFields(value: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  return Object.fromEntries(
+    keys.filter((key) => value[key] !== undefined).map((key) => [key, redactUnknown(value[key])]),
+  );
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 export function estimateProjectionTokens(text: string): number {
@@ -1772,6 +2289,8 @@ export function estimateProjectionTokens(text: string): number {
   } as Parameters<typeof estimateTokens>[0]);
 }
 
+const MAX_TRUNCATION_PREVIEW_BYTES = 1_000;
+
 async function budgetProjection(
   projection: Record<string, unknown>,
   budget: number,
@@ -1779,42 +2298,102 @@ async function budgetProjection(
   summaryKeys: readonly string[] = [],
 ): Promise<Record<string, unknown>> {
   const text = JSON.stringify(projection);
-  const tokenCount = estimateProjectionTokens(text);
-  if (tokenCount <= budget) return projection;
-  const { path } = await tempOutput.write(text);
-  if (summaryKeys.length === 0) {
-    const keepName = estimateProjectionTokens(
-      JSON.stringify({
-        kind: projection.kind ?? "repository",
-        nameWithOwner: projection.nameWithOwner ?? null,
-        truncated: true,
-        omittedCount: 0,
-        tokenCount,
-        tokenBudget: budget,
-        fullPath: path,
-      }),
-    ) <= budget;
-    const kept = new Set(keepName ? ["kind", "nameWithOwner"] : ["kind"]);
-    return {
-      kind: projection.kind ?? "repository",
-      ...(keepName ? { nameWithOwner: projection.nameWithOwner ?? null } : {}),
+  const visibleTokenCount = estimateProjectionTokens(text);
+  const fullProjection = (projection as SpillAwareProjection)[FULL_PROJECTION];
+  if (visibleTokenCount <= budget && !fullProjection) return projection;
+
+  const fullText = JSON.stringify(fullProjection ?? projection);
+  const tokenCount = estimateProjectionTokens(fullText);
+  const { path } = await tempOutput.write(fullText);
+  if (visibleTokenCount <= budget && fullProjection) {
+    const visibleWithFallback = {
+      ...projection,
       truncated: true,
-      omittedCount: Object.keys(projection).filter((key) => !kept.has(key)).length,
       tokenCount,
       tokenBudget: budget,
       fullPath: path,
     };
+    if (estimateProjectionTokens(JSON.stringify(visibleWithFallback)) <= budget) return visibleWithFallback;
   }
-  const kept = new Set(["kind", ...summaryKeys.filter((key) => key in projection)]);
-  return {
+  const countKeys = Object.keys(projection).filter(
+    (key) => typeof projection[key] === "number",
+  );
+  const identifierKeys = summaryKeys.length > 0
+    ? summaryKeys.filter((key) => key in projection)
+    : ["nameWithOwner", "target", ...countKeys].filter((key) => key in projection);
+  if ("target" in projection && !identifierKeys.includes("target")) identifierKeys.push("target");
+  const kept = new Set(["kind", ...identifierKeys]);
+  const envelope: Record<string, unknown> = {
     kind: projection.kind ?? "content",
-    ...Object.fromEntries(summaryKeys.filter((key) => key in projection).map((key) => [key, projection[key]])),
+    ...Object.fromEntries(identifierKeys.map((key) => [key, compactTruncationIdentifier(key, projection[key])])),
     truncated: true,
     omittedCount: Object.keys(projection).filter((key) => !kept.has(key)).length,
     tokenCount,
     tokenBudget: budget,
     fullPath: path,
   };
+  return withBoundedPreview(envelope, fullText, budget, identifierKeys);
+}
+
+const MAX_TRUNCATION_IDENTIFIER_BYTES = 160;
+
+function compactTruncationIdentifier(key: string, value: unknown, maxBytes = MAX_TRUNCATION_IDENTIFIER_BYTES): unknown {
+  if (key !== "target") return compactTruncationValue(value, maxBytes);
+  const target = resourceRecord(value);
+  if (Object.keys(target).length === 0) return compactTruncationValue(value, maxBytes);
+  const keys = ["kind", "host", "owner", "name", "number", "sha", "tag", "runId", "jobId", "ref", "path", "base", "head"];
+  const entries = keys.filter((targetKey) => target[targetKey] !== undefined);
+  const stringBudget = Math.max(16, Math.floor(maxBytes / Math.max(1, entries.length)));
+  return Object.fromEntries(entries.map((targetKey) => [
+    targetKey,
+    typeof target[targetKey] === "string"
+      ? boundedUtf8(redactSecrets(target[targetKey] as string), stringBudget)
+      : redactUnknown(target[targetKey]),
+  ]));
+}
+
+function compactTruncationValue(value: unknown, maxBytes: number): unknown {
+  if (typeof value === "string") return boundedUtf8(redactSecrets(value), maxBytes);
+  if (value === null || typeof value !== "object") return redactUnknown(value);
+  return boundedUtf8(JSON.stringify(redactUnknown(value)), maxBytes);
+}
+
+function withBoundedPreview(
+  envelope: Record<string, unknown>,
+  source: string,
+  budget: number,
+  identifierKeys: readonly string[],
+): Record<string, unknown> {
+  const redactedSource = redactSecrets(source);
+  let preview = boundedUtf8(redactedSource, MAX_TRUNCATION_PREVIEW_BYTES);
+  const previewTruncated = Buffer.byteLength(redactedSource, "utf8") > Buffer.byteLength(preview, "utf8");
+  const result: Record<string, unknown> = { ...envelope, preview, previewTruncated };
+  while (preview.length > 0 && estimateProjectionTokens(JSON.stringify(result)) > budget) {
+    preview = boundedUtf8(preview, Math.max(0, Buffer.byteLength(preview, "utf8") - 64));
+    result.preview = preview;
+  }
+  for (const key of identifierKeys) {
+    if (estimateProjectionTokens(JSON.stringify(result)) <= budget || !(key in result)) break;
+    result[key] = compactTruncationIdentifier(key, result[key], 32);
+    if (estimateProjectionTokens(JSON.stringify(result)) > budget) delete result[key];
+  }
+  // A caller-provided temp path or an unusually small future budget must not
+  // bypass the final budget invariant after the preview is exhausted.
+  for (const key of ["preview", "previewTruncated", "fullPath", "omittedCount", "tokenCount"] as const) {
+    if (estimateProjectionTokens(JSON.stringify(result)) <= budget) break;
+    delete result[key];
+  }
+  return result;
+}
+
+function boundedUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = Buffer.byteLength("…", "utf8") <= maxBytes ? "…" : "";
+  const limit = Math.max(0, maxBytes - Buffer.byteLength(suffix, "utf8"));
+  let preview = Buffer.from(value, "utf8").subarray(0, limit).toString("utf8");
+  while (Buffer.byteLength(preview, "utf8") > limit) preview = preview.slice(0, -1);
+  return preview + suffix;
 }
 
 function hostnameArgs(target: ResourceTarget | undefined): string[] {
@@ -1884,7 +2463,7 @@ function compareSemver(left: string, right: string): number {
 }
 
 function asString(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
+  return typeof value === "string" && value.length > 0 ? redactSecrets(value) : null;
 }
 
 function asNumber(value: unknown): number {

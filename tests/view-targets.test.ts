@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { GhExecutionError, resolveResourceTarget } from "../extensions/gh/index.ts";
-import { callView, loadExtension, scriptedExecutor } from "./helpers.ts";
+import { callView, createFakeExecutor, defaultVersionResult, loadExtension, scriptedExecutor } from "./helpers.ts";
 
 test("gh_view resolves every supported github.com URL shape", () => {
   const cases = [
@@ -64,21 +64,35 @@ test("owner/repo#number requires an explicit issue or pull-request kind", () => 
 });
 
 test("the model-facing gh_view accepts every supported URL resource kind", async () => {
-  const rawTargets = [
-    "https://github.com/cli/cli/issues/42",
-    "https://github.com/cli/cli/pull/43",
-    "https://github.com/cli/cli/commit/abc123",
-    "https://github.com/cli/cli/releases/tag/v2.81.0",
-    "https://github.com/cli/cli/actions/runs/100",
-    "https://github.com/cli/cli/actions/runs/100/job/200",
-    "https://github.com/cli/cli/blob/trunk/README.md",
-    "https://github.com/cli/cli/tree/trunk/docs",
-    "https://github.com/cli/cli/compare/main...feature",
-  ];
-  const loaded = loadExtension({ executor: scriptedExecutor().execute });
+  const fixtures = [
+    ["https://github.com/cli/cli/issues/42", { number: 42, title: "Issue", state: "OPEN" }],
+    ["https://github.com/cli/cli/pull/43", { number: 43, title: "Pull request", state: "OPEN" }],
+    ["https://github.com/cli/cli/commit/abc123", { sha: "abc123", commit: { message: "Commit" } }],
+    ["https://github.com/cli/cli/releases/tag/v2.81.0", { tagName: "v2.81.0" }],
+    ["https://github.com/cli/cli/actions/runs/100", { databaseId: 100 }],
+    ["https://github.com/cli/cli/actions/runs/100/job/200", { databaseId: 200 }],
+    ["https://github.com/cli/cli/blob/trunk/README.md", { type: "file", content: "README" }],
+    ["https://github.com/cli/cli/tree/trunk/docs", { sha: "tree", tree: [] }],
+    ["https://github.com/cli/cli/compare/main...feature", { status: "ahead", base_commit: { sha: "main" }, commits: [], files: [] }],
+  ] as const;
+  const executor = createFakeExecutor((request) => {
+    if (request.argv[0] === "--version") return defaultVersionResult();
+    const argv = request.argv.join(" ");
+    const fixture = argv.startsWith("issue ") ? fixtures[0]
+      : argv.startsWith("pr ") ? fixtures[1]
+        : argv.includes("commits/abc123") ? fixtures[2]
+          : argv.startsWith("release ") ? fixtures[3]
+            : argv.startsWith("run ") && argv.includes("--job") ? fixtures[5]
+              : argv.startsWith("run ") ? fixtures[4]
+                : argv.includes("contents/") ? fixtures[6]
+                  : argv.includes("git/trees/") ? fixtures[7]
+                    : fixtures[8];
+    return { stdout: JSON.stringify(fixture[1]), stderr: "", code: 0, killed: false };
+  });
+  const loaded = loadExtension({ executor: executor.execute });
   const tool = loaded.tools.get("gh_view");
   assert.ok(tool);
-  for (const target of rawTargets) {
+  for (const [target] of fixtures) {
     const result = await callView(tool, { target });
     assert.equal((result.details as { kind: string }).kind, resolveResourceTarget(target).kind);
   }

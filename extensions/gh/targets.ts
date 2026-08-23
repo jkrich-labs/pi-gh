@@ -52,6 +52,13 @@ export function resolveResourceTarget(raw: string | undefined, options: ResolveT
       throw new GhExecutionError("unsupported", "GitHub resource URLs must not include a port.");
     }
     const target = fromHostPath(normalizeHost(url.hostname), url.pathname);
+    const fragment = decodeUrlFragment(url.hash);
+    if ((target.kind === "issue" || target.kind === "pull_request") && isCommentOrReviewAnchor(fragment)) {
+      throw new GhExecutionError(
+        "validation",
+        "A comment or review anchor identifies a discussion item, not the issue or pull request. Remove the anchor to view the resource.",
+      );
+    }
     assertKind(target, options.kind);
     return target;
   }
@@ -116,7 +123,7 @@ function fromHostPath(host: string, pathname: string): ResourceTarget {
       return issueTarget(host, owner, name, parts[3], parts.length);
     case "pull":
     case "pulls":
-      return pullRequestTarget(host, owner, name, parts[3], parts.length);
+      return pullRequestTarget(host, owner, name, parts[3], parts.slice(4), pathname);
     case "commit":
     case "commits":
       return commitTarget(host, owner, name, parts[3], parts.length);
@@ -132,7 +139,9 @@ function fromHostPath(host: string, pathname: string): ResourceTarget {
     case "tree":
       return contentTarget(host, owner, name, parts.slice(3), "tree", pathname);
     case "compare":
-      return compareTarget(host, owner, name, parts[3], pathname);
+      // GitHub permits slashes in head refs. Join all remaining segments so
+      // /compare/main...feature/with/slash is not silently shortened.
+      return compareTarget(host, owner, name, parts.slice(3).join("/"), pathname);
     default:
       throw unsupportedPath(pathname);
   }
@@ -150,7 +159,7 @@ function parseIdentifier(raw: string, kindHint?: ViewResourceKind): ResourceTarg
     const repo = parseRepositoryIdentifier(hash[1]!);
     return kindHint === "issue"
       ? issueTarget(repo.host, repo.owner, repo.name, hash[2], 4)
-      : pullRequestTarget(repo.host, repo.owner, repo.name, hash[2], 4);
+      : pullRequestTarget(repo.host, repo.owner, repo.name, hash[2]);
   }
 
   const at = /^(.*)@([^@/]+)$/.exec(raw);
@@ -184,14 +193,36 @@ function issueTarget(host: string, owner: string, name: string, rawNumber: strin
   return { kind: "issue", ...repoFields(host, owner, name), number: resourceNumber(rawNumber, length, 4) };
 }
 
+const PULL_REQUEST_SUBROUTES = new Set(["changes", "checks", "commits", "conversation", "files", "reviews"]);
+const COMMENT_OR_REVIEW_ANCHOR_RE = /^#(?:issuecomment-\d+|discussion_r\d+|pullrequestreview(?:comment)?-\d+|commitcomment-\d+)$/i;
+
+function isCommentOrReviewAnchor(hash: string): boolean {
+  return COMMENT_OR_REVIEW_ANCHOR_RE.test(hash);
+}
+
+function decodeUrlFragment(hash: string): string {
+  try {
+    return decodeURIComponent(hash);
+  } catch {
+    throw new GhExecutionError("validation", "Resource target URL contains invalid fragment encoding.");
+  }
+}
+
 function pullRequestTarget(
   host: string,
   owner: string,
   name: string,
   rawNumber: string | undefined,
-  length: number,
+  subroute: readonly string[] = [],
+  pathname?: string,
 ): ResourceTarget {
-  return { kind: "pull_request", ...repoFields(host, owner, name), number: resourceNumber(rawNumber, length, 4) };
+  if (!rawNumber || !/^\d+$/.test(rawNumber)) {
+    throw new GhExecutionError("unsupported", "Invalid numbered GitHub resource URL target.");
+  }
+  if (subroute.length > 0 && (subroute.length !== 1 || !PULL_REQUEST_SUBROUTES.has(subroute[0]!))) {
+    throw unsupportedPath(pathname ?? `/${owner}/${name}/pull/${rawNumber}/${subroute.join("/")}`);
+  }
+  return { kind: "pull_request", ...repoFields(host, owner, name), number: positiveNumber(rawNumber, rawNumber) };
 }
 
 function commitTarget(host: string, owner: string, name: string, sha: string | undefined, length: number): ResourceTarget {

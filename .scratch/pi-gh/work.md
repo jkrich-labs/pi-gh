@@ -159,6 +159,66 @@
 - **Status:** done
 - **Resolutions:** Offline verification, package dry-run, CI, smoke-check, and a credential-gated live evaluation through pi JSON event mode are implemented. The live runner uses a fake gh executable to capture model tool calls without mutating GitHub. The configured pi evaluation passed 4/4 fixtures with 100% schema validity and zero unsafe write misroutes.
 
+## S-10 — Make resource views compact and truthful
+
+- **Delivers:** Correct nested tree, commit, compare, binary file, expanded issue/PR/release, URL-normalization, and readable truncation behaviour through `gh_view` and content tools.
+- **Blocked by:** S-09
+- **Consumes:** Resource target resolver, view argv builder, projectors, and token budget pipeline.
+- **Produces:** Explicit resource projections and stable oversized-result previews.
+- **Seam(s) to test at:** Registered `gh_view` and content tools with fake executor responses.
+- **Tier:** general — related fixes span target grammar, API requests, resource projections, and truncation.
+- **Est. cost:** ~18k tokens / 35–50 minutes
+- **Acceptance criteria:**
+  - [x] `node --test tests/view-targets.test.ts tests/content.test.ts tests/truncation.test.ts tests/regression-hardening.test.ts --test-name-pattern='tree|commit|compare|binary|expanded|subroute|anchor|spill'` passes.
+  - [x] `node --test tests/token-budget.test.ts` proves compact and expanded projections remain within budget.
+  - [x] `npm run typecheck` passes.
+- **Status:** done
+
+## S-11 — Repair CI diagnosis projections
+
+- **Delivers:** Correct job identity and steps, real failed-step extraction, contextual no-check handling, and one normalized workflow-run shape.
+- **Blocked by:** S-09
+- **Consumes:** CI target normalization, executor, error classifier, and budget pipeline.
+- **Produces:** Stable run/job/check/log projections.
+- **Seam(s) to test at:** Registered CI tools with real-format fake CLI and REST fixtures.
+- **Tier:** general — output-format compatibility and fallback behaviour require coordinated tests and implementation.
+- **Est. cost:** ~16k tokens / 30–45 minutes
+- **Acceptance criteria:**
+  - [ ] `node --test tests/ci.test.ts tests/ci-logs.test.ts tests/fixes.test.ts tests/regression-hardening.test.ts --test-name-pattern='job|failed logs|checks|workflow'` passes.
+  - [ ] `node --test tests/token-budget.test.ts --test-name-pattern='CI'` passes.
+  - [ ] `npm run typecheck` passes.
+- **Status:** ready
+
+## S-12 — Make capability discovery intent-safe
+
+- **Delivers:** Focused release-list and issue-comment reads plus deterministic read/write intent ranking that never activates writes for read-only requests.
+- **Blocked by:** S-09
+- **Consumes:** Operation registry, capability loader, bounded list projections, and existing target normalization.
+- **Produces:** `gh_list_releases`, `gh_issue_comments`, and intent-aware search ranking.
+- **Seam(s) to test at:** Registry and registered `gh_find`/read tools.
+- **Tier:** general — registry metadata, ranking policy, schemas, execution, and live safety fixtures change together.
+- **Est. cost:** ~14k tokens / 25–40 minutes
+- **Acceptance criteria:**
+  - [ ] `node --test tests/loader.test.ts tests/registry-contract.test.ts tests/regression-hardening.test.ts --test-name-pattern='release|comment|read intent|write intent|unsafe'` passes.
+  - [ ] `node --test tests/content.test.ts --test-name-pattern='release|comment'` passes.
+  - [ ] `npm run typecheck` passes.
+- **Status:** ready
+
+## S-13 — Tighten API projections and contextual errors
+
+- **Delivers:** Safe root jq slices/indexes, useful compact API overflow previews, explicit unsupported-host/empty-target errors, and contextual malformed-output errors.
+- **Blocked by:** S-10, S-11, S-12
+- **Consumes:** API validator, error classifier, target resolver, and improved budget projection.
+- **Produces:** Consistent actionable failure envelopes at the tool seam.
+- **Seam(s) to test at:** Registered `gh_api_get`, `gh_view`, and CI tools.
+- **Tier:** general — validation and error contracts are cross-cutting but bounded by existing seams.
+- **Est. cost:** ~10k tokens / 20–30 minutes
+- **Acceptance criteria:**
+  - [ ] `node --test tests/api-get.test.ts tests/view-targets.test.ts tests/regression-hardening.test.ts --test-name-pattern='slice|preview|host|empty|malformed|context'` passes.
+  - [ ] `npm run verify` passes on the integrated tree.
+  - [ ] `npm run smoke:gh` passes without mutation.
+- **Status:** ready
+
 ## Cost and dependency summary
 
 - **Sequential spine:** S-01 → S-02 → S-09.

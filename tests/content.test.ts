@@ -120,7 +120,8 @@ test("gh_read_file identifies binary responses without decoding them as text", a
   const projection = projectionOf(result) as Record<string, unknown>;
   assert.equal(projection.binary, true);
   assert.equal(projection.byteCount, bytes.length);
-  assert.equal(projection.contentBase64, bytes.toString("base64"));
+  assert.equal("content" in projection, false);
+  assert.equal("contentBase64" in projection, false);
 });
 
 test("content tools reject unsafe repository paths before invoking gh", async () => {
