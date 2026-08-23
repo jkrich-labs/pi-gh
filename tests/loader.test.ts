@@ -103,6 +103,32 @@ test("gh_find loads exact pull request write tools", async () => {
   }
 });
 
+test("gh_find loads the uncommon REST API read tool", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const projection = projectionOf(await tool.execute("api read", { query: "REST API read", limit: 1 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+  assert.equal(projection.matches[0]?.name, "gh_api_get");
+  assert.equal(loaded.activeTools.includes("gh_api_get"), true);
+  for (const [query, expected] of [
+    ["get and read issue", "gh_view"],
+    ["get and read directory", "gh_list_directory"],
+    ["get and read checks", "gh_pr_checks"],
+    ["get and read logs", "gh_failed_logs"],
+    ["get and read pull_request", "gh_view"],
+    ["get and read workflow_run", "gh_view"],
+    ["REST API read issue", "gh_view"],
+    ["REST API read directory", "gh_list_directory"],
+    ["REST API read checks", "gh_pr_checks"],
+    ["read API logs", "gh_failed_logs"],
+  ] as const) {
+    const focused = projectionOf(await tool.execute("focused", { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+    assert.equal(focused.matches[0]?.name, expected);
+    const bounded = projectionOf(await tool.execute("focused-bounded", { query, limit: 3 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+    assert.equal(bounded.matches.some((match) => match.name === "gh_api_get"), false);
+  }
+});
+
 test("gh_find loads dispatch rerun cancel and release tools", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");

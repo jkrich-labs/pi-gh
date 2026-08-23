@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { ActionReleaseKind, CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
+import type { ActionReleaseKind, ApiKind, CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -26,6 +26,11 @@ export const DEFAULT_PR_FILES_LIMIT = 30;
 export const DEFAULT_WORKFLOW_RUN_LIMIT = 20;
 export const MAX_LOG_LINES = 10_000;
 export const MAX_LOG_BYTES = 1_000_000;
+export const MAX_API_RESPONSE_BYTES = 1_000_000;
+export const MAX_API_QUERY_ENTRIES = 50;
+export const MAX_API_QUERY_KEY_BYTES = 100;
+export const MAX_API_QUERY_VALUE_BYTES = 2_000;
+export const MAX_API_QUERY_BYTES = 16_000;
 export const REPO_VIEW_FIELDS =
   "name,nameWithOwner,description,url,visibility,isPrivate,isFork,isArchived,stargazerCount,forkCount,primaryLanguage,defaultBranchRef,updatedAt,createdAt,homepageUrl,licenseInfo,repositoryTopics,owner";
 
@@ -119,12 +124,25 @@ export interface ActionReleaseRequestInput {
   asset?: string;
 }
 
+export interface ApiGetRequestInput {
+  kind: ApiKind;
+  endpoint: string;
+  host?: string;
+  query?: Record<string, string>;
+  page?: number;
+  perPage?: number;
+  cache?: string;
+  jq?: string;
+  detail?: "compact" | "expanded";
+}
+
 export interface GhExecRequest {
   argv: string[];
   cwd?: string;
   timeout?: number;
   signal?: AbortSignal;
   stdin?: string;
+  maxOutputBytes?: number;
 }
 
 export interface GhExecResult {
@@ -237,17 +255,24 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       }
       throw error;
     }
-    const category = classifyGhFailure(result, request.signal);
+    if (request.maxOutputBytes !== undefined && Buffer.byteLength(result.stdout, "utf8") > request.maxOutputBytes) {
+      throw new GhExecutionError("validation", "GitHub CLI output exceeded the bounded response limit.", {
+        byteCount: Buffer.byteLength(result.stdout, "utf8"),
+        maxOutputBytes: request.maxOutputBytes,
+      });
+    }
+    const diagnostic = boundedDiagnostics(result);
+    const category = classifyGhFailure(diagnostic, request.signal);
     if (category) {
-      throw new GhExecutionError(category, describeFailure(category, result), {
-        stderr: result.stderr,
-        code: result.code,
+      throw new GhExecutionError(category, describeFailure(category, diagnostic), {
+        stderr: diagnostic.stderr,
+        code: diagnostic.code,
       });
     }
     if (result.code !== 0) {
-      throw new GhExecutionError("unsupported", describeFailure("unsupported", result), {
-        stderr: result.stderr,
-        code: result.code,
+      throw new GhExecutionError("unsupported", describeFailure("unsupported", diagnostic), {
+        stderr: diagnostic.stderr,
+        code: diagnostic.code,
       });
     }
     return result;
@@ -477,6 +502,44 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     };
   }
 
+  async function runApiGet(
+    input: ApiGetRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<{ projection: Record<string, unknown>; target: ApiTarget }> {
+    throwIfAborted(ctx.signal);
+    const host = normalizeHost(input.host ?? "github.com");
+    const endpoint = normalizeApiEndpoint(input.endpoint);
+    validateJq(input.jq);
+    validateApiCache(input.cache);
+    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const perPage = clamp(input.perPage, 50, 1, 50);
+    await ensureGh(ctx.signal);
+    await ensureHost(host, ctx.signal);
+    validateApiQuery(input.query);
+    const safeEndpoint = redactSecrets(endpoint);
+    const safeTarget: ApiTarget = { kind: "api", host, endpoint: safeEndpoint };
+    const result = await run({ argv: buildApiGetArgv(input, host, endpoint, page, perPage), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    const outputBytes = Buffer.byteLength(result.stdout, "utf8");
+    if (outputBytes > MAX_API_RESPONSE_BYTES) {
+      const { path } = await tempOutput.write(result.stdout);
+      const oversized = { kind: "api_get", target: safeTarget, endpoint: safeEndpoint, host, page, perPage, truncated: true, byteCount: outputBytes, tokenBudget: input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, fullPath: path };
+      const projection = await budgetProjection(oversized, input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, tempOutput);
+      return { projection, target: safeTarget };
+    }
+    let data: unknown;
+    if (input.jq) {
+      data = result.stdout.trim();
+    } else {
+      try {
+        data = JSON.parse(result.stdout);
+      } catch {
+        throw new GhExecutionError("malformed_json", "GitHub API returned malformed JSON.");
+      }
+    }
+    const projection = await budgetProjection({ kind: "api_get", target: safeTarget, endpoint: safeEndpoint, host, page, perPage, data: projectApiData(data) }, input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, tempOutput);
+    return { projection, target: safeTarget };
+  }
+
   async function runActionReleaseWrite(
     input: ActionReleaseRequestInput,
     ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
@@ -502,7 +565,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     return { projection: { kind: actionReleaseResultKind(input.kind), target, output: result.stdout.trim() }, target };
   }
 
-  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, ensureHost };
+  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, runApiGet, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -1064,6 +1127,63 @@ function targetPullRequestNumber(target: ResourceTarget): number {
   return target.number;
 }
 
+type ApiTarget = { kind: "api"; host: string; endpoint: string };
+
+function normalizeApiEndpoint(raw: string): string {
+  const trimmed = raw.trim();
+  const endpoint = trimmed.replace(/^\/+/, "");
+  if (Buffer.byteLength(endpoint, "utf8") > 512) throw new GhExecutionError("validation", "API GET endpoints must be at most 512 bytes.");
+  if (!endpoint || endpoint.startsWith("-") || trimmed.startsWith("//") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(endpoint) || /^\/*https?:\/\//i.test(trimmed) || /^https?:\/\//i.test(endpoint) || endpoint.toLowerCase().startsWith("graphql") || endpoint.split("/").some((part) => part === "" || part === "." || part === "..") || /(?:^|\/)(?:archive|zipball|tarball|downloads?|raw)(?:\/|$)/i.test(endpoint) || /(?:^|\/)actions\/(?:artifacts(?:\/|$)|runs\/[^/]+\/logs(?:\/|$)|jobs\/[^/]+\/logs(?:\/|$))/i.test(endpoint) || endpoint.includes(":") || endpoint.includes("%") || endpoint.includes("{") || endpoint.includes("}") || endpoint.includes("?") || endpoint.includes("#") || endpoint.includes("@") || endpoint.includes("\\") || endpoint.includes("\u0000")) {
+    throw new GhExecutionError("validation", "API GET endpoints must be relative REST paths without placeholders, queries, fragments, file expansion, or traversal.");
+  }
+  return endpoint;
+}
+
+function validateJq(jq: string | undefined): void {
+  if (jq === undefined) return;
+  const expression = jq.trim();
+  const path = /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]+\]|\[\])+$/;
+  if (expression !== "." && (!expression || expression.split("|").some((part) => !path.test(part.trim())))) {
+    throw new GhExecutionError("validation", "API GET jq projections are limited to data paths and array indexes.");
+  }
+}
+
+function validateApiCache(cache: string | undefined): void {
+  if (cache !== undefined && !/^\d+[smh]$/.test(cache)) {
+    throw new GhExecutionError("validation", "API GET cache duration must use seconds, minutes, or hours.");
+  }
+}
+
+function validateApiQuery(query: Record<string, string> | undefined): void {
+  const entries = Object.entries(query ?? {});
+  if (entries.length > MAX_API_QUERY_ENTRIES) throw new GhExecutionError("validation", "API GET query parameters exceed the entry limit.");
+  let totalBytes = 0;
+  for (const [key, value] of entries) {
+    const keyBytes = Buffer.byteLength(key, "utf8");
+    const valueBytes = Buffer.byteLength(value, "utf8");
+    totalBytes += keyBytes + valueBytes;
+    if (keyBytes > MAX_API_QUERY_KEY_BYTES || valueBytes > MAX_API_QUERY_VALUE_BYTES || totalBytes > MAX_API_QUERY_BYTES || !/^[A-Za-z][A-Za-z0-9_]*$/.test(key) || key === "page" || key === "per_page" || key.includes("@") || key.includes("\u0000") || value.includes("@") || value.includes("\u0000")) {
+      throw new GhExecutionError("validation", "API GET query parameters exceed safety limits or contain forbidden syntax.");
+    }
+  }
+}
+
+function buildApiGetArgv(input: ApiGetRequestInput, host: string, endpoint: string, page: number, perPage: number): string[] {
+  return [
+    "api", "--hostname", host, endpoint, "--method", "GET",
+    ...Object.entries(input.query ?? {}).flatMap(([key, value]) => ["--raw-field", `${key}=${value}`]),
+    "--raw-field", `page=${page}`, "--raw-field", `per_page=${perPage}`,
+    ...(input.cache ? ["--cache", input.cache] : []), ...(input.jq ? ["--jq", input.jq] : []),
+  ];
+}
+
+function projectApiData(value: unknown): unknown {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(projectApiData);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactSecrets(key), projectApiData(nested)]));
+  return value;
+}
+
 function resolveReleaseTarget(raw: string): Extract<ResourceTarget, { kind: "release" }> {
   const target = resolveResourceTarget(raw, { kind: "release" });
   if (target.kind !== "release") throw new GhExecutionError("validation", "A release target is required.");
@@ -1225,15 +1345,36 @@ function cliRepositoryTarget(target: ResourceTarget): string {
 function extractAuthenticatedHosts(value: unknown): string[] {
   if (!value || typeof value !== "object") return [];
   const hosts = (value as { hosts?: unknown }).hosts;
-  if (Array.isArray(hosts)) return hosts.filter((host): host is string => typeof host === "string").map(normalizeHost);
-  if (!hosts || typeof hosts !== "object") return [];
-  return Object.keys(hosts).map(normalizeHost);
+  if (!hosts || typeof hosts !== "object" || Array.isArray(hosts)) return [];
+  return Object.entries(hosts)
+    .filter(([, accounts]) => authenticatedAccountState(accounts))
+    .map(([host]) => normalizeHost(host));
+}
+
+function authenticatedAccountState(accounts: unknown): boolean {
+  if (!Array.isArray(accounts) || accounts.length === 0) return false;
+  const records = accounts.filter((account): account is Record<string, unknown> => Boolean(account) && typeof account === "object");
+  const active = records.filter((account) => account.active === true);
+  return active.length > 0 && active.every((account) => account.state === "success");
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new GhExecutionError("aborted", describeFailure("aborted", emptyResult()));
   }
+}
+
+function boundedDiagnostics(result: GhExecResult): GhExecResult {
+  const bound = (value: string) => {
+    const bytes = Buffer.from(value, "utf8");
+    if (bytes.length <= MAX_API_RESPONSE_BYTES) return value;
+    const suffix = Buffer.from("…[truncated]", "utf8");
+    const limit = Math.max(0, MAX_API_RESPONSE_BYTES - suffix.length);
+    let prefix = bytes.subarray(0, limit).toString("utf8");
+    while (Buffer.byteLength(prefix, "utf8") > limit) prefix = prefix.slice(0, -1);
+    return prefix + suffix.toString("utf8");
+  };
+  return { ...result, stdout: bound(result.stdout), stderr: bound(result.stderr) };
 }
 
 function emptyResult(): GhExecResult {

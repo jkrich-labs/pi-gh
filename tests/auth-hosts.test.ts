@@ -17,7 +17,7 @@ test("authenticated GHES hosts are read from gh auth JSON and selected for the v
   const executor = createFakeExecutor((request) => {
     if (request.argv[0] === "--version") return { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false };
     if (request.argv[0] === "auth") {
-      return { stdout: JSON.stringify({ hosts: { "ghe.example.com": [{}] } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ hosts: { "ghe.example.com": [{ state: "success", active: true }] } }), stderr: "", code: 0, killed: false };
     }
     return { stdout: JSON.stringify(REPO_VIEW_JSON), stderr: "", code: 0, killed: false };
   });
@@ -47,11 +47,22 @@ test("an unauthenticated GHES host fails closed before the repository call", asy
   assert.equal(executor.calls.some((call) => call.argv[0] === "repo"), false);
 });
 
+test("failed GHES authentication states are not trusted", async () => {
+  const executor = createFakeExecutor((request) => {
+    if (request.argv[0] === "--version") return { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false };
+    if (request.argv[0] === "auth") return { stdout: JSON.stringify({ hosts: { "ghe.example.com": [{ state: "failure" }] } }), stderr: "", code: 0, killed: false };
+    return { stdout: JSON.stringify(REPO_VIEW_JSON), stderr: "", code: 0, killed: false };
+  });
+  const loaded = loadExtension({ executor: executor.execute });
+  await assert.rejects(() => callView(loaded.tools.get("gh_view")!, { target: "https://ghe.example.com/team/project" }), (error: unknown) => error instanceof GhExecutionError && error.category === "auth");
+  assert.equal(executor.calls.some((call) => call.argv[0] === "repo"), false);
+});
+
 test("the host allowlist is cached for repeated GHES views", async () => {
   const executor = createFakeExecutor((request) => {
     if (request.argv[0] === "--version") return { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false };
     if (request.argv[0] === "auth") {
-      return { stdout: JSON.stringify({ hosts: ["ghe.example.com"] }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ hosts: { "ghe.example.com": [{ state: "success", active: true }] } }), stderr: "", code: 0, killed: false };
     }
     return { stdout: JSON.stringify(REPO_VIEW_JSON), stderr: "", code: 0, killed: false };
   });

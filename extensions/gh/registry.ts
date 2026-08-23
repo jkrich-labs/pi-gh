@@ -327,6 +327,27 @@ export const deleteReleaseAssetParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const apiGetParameters = Type.Object(
+  {
+    endpoint: Type.String({ description: "GitHub REST endpoint path, without a host or query string", maxLength: 512 }),
+    host: Type.Optional(Type.String({ description: "github.com or an authenticated GHES host" })),
+    query: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Typed query parameters", maxProperties: 50 })),
+    page: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 1 })),
+    perPage: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, default: 50 })),
+    cache: Type.Optional(Type.String({ pattern: "^[0-9]+(s|m|h)$" })),
+    jq: Type.Optional(Type.String({ description: "Read-only jq projection" })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const apiOperationKinds = { gh_api_get: "api_get" } as const;
+export type ApiOperationName = keyof typeof apiOperationKinds;
+export type ApiKind = (typeof apiOperationKinds)[ApiOperationName];
+export const apiOperations: readonly Operation[] = [
+  readOperation({ name: "gh_api_get", label: "GitHub API GET", description: "Read a bounded GitHub REST endpoint with a forced GET method and typed query parameters.", aliases: ["github api get", "rest api read", "get github endpoint"], keywords: ["api", "rest", "get", "endpoint", "query", "read"], resourceKind: "api response", verb: "read", parameters: apiGetParameters, argvFixture: ["api", "repos/OWNER/REPO", "--method", "GET"], buildArgv: () => ["api", "repos/OWNER/REPO", "--method", "GET"] }),
+];
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -743,7 +764,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...actionReleaseOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...actionReleaseOperations, ...apiOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {
@@ -781,6 +802,10 @@ function tokenize(value: string): string[] {
 }
 
 function scoreOperation(operation: Operation, terms: string[]): number {
+  if (operation.name === "gh_api_get") {
+    const focusedResource = new Set(["issue", "issues", "pull", "pulls", "pr", "pull_request", "repository", "repositories", "repo", "release", "run", "runs", "workflow_run", "job", "jobs", "file", "files", "tree", "directory", "directories", "commit", "commits", "compare", "workflow", "workflows", "checks", "check", "logs", "log", "ci", "diff", "content", "search"]);
+    if (terms.some((term) => focusedResource.has(term))) return 0;
+  }
   const name = operation.name.toLowerCase();
   const aliases = operation.aliases.map((value) => value.toLowerCase());
   const keywords = operation.keywords.map((value) => value.toLowerCase());
@@ -788,6 +813,7 @@ function scoreOperation(operation: Operation, terms: string[]): number {
   const verb = operation.verb.toLowerCase();
   const description = `${operation.label} ${operation.description}`.toLowerCase();
   let score = aliases.some((alias) => alias.replace(/[^a-z0-9]+/g, " ").trim() === terms.join(" ")) ? 300 : 0;
+  if (operation.name === "gh_view" && terms.some((term) => ["issue", "issues", "pull", "pr", "pull_request", "repository", "repo", "release", "run", "workflow_run", "job", "file", "tree", "commit", "compare"].includes(term))) score += 100;
 
   for (const term of terms) {
     if (name === term || name.replace(/^gh_/, "") === term) score += 100;

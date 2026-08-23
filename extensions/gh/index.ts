@@ -1,7 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { GhExecutionError } from "./errors.ts";
 import {
   createPipeline,
   createPiExecutor,
+  type ApiGetRequestInput,
   type ActionReleaseRequestInput,
   type ContentRequestInput,
   type GhDependencies,
@@ -11,6 +13,8 @@ import {
 } from "./execute.ts";
 import {
   actionReleaseOperationKinds,
+  apiGetParameters,
+  apiOperationKinds,
   checksParameters,
   createReleaseParameters,
   deleteReleaseAssetParameters,
@@ -46,6 +50,7 @@ import {
   searchOperationKinds,
   type Operation,
   type ActionReleaseKind,
+  type ApiKind,
   type CiKind,
   type OperationRegistry,
   type PullRequestKind,
@@ -98,6 +103,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerPullRequestTool(pi, operation, pipeline, pullRequestOperationKinds[operation.name as keyof typeof pullRequestOperationKinds]);
       } else if (operation.name in actionReleaseOperationKinds) {
         registerActionReleaseTool(pi, operation, pipeline, actionReleaseOperationKinds[operation.name as keyof typeof actionReleaseOperationKinds]);
+      } else if (operation.name in apiOperationKinds) {
+        registerApiTool(pi, operation, pipeline, apiOperationKinds[operation.name as keyof typeof apiOperationKinds]);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -414,6 +421,38 @@ function registerActionReleaseTool(pi: ExtensionAPI, operation: Operation, pipel
       };
       const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
       const { projection, target } = await pipeline.runActionReleaseWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
+      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
+    },
+  });
+}
+
+function registerApiTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>, kind: ApiKind): void {
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: apiGetParameters,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const allowed = new Set(["endpoint", "host", "query", "page", "perPage", "cache", "jq", "detail"]);
+      const unknown = Object.keys(values).find((key) => !allowed.has(key));
+      if (unknown) throw new GhExecutionError("validation", `Unsupported GitHub API GET parameter: ${unknown}`);
+      const input: ApiGetRequestInput = {
+        kind,
+        endpoint: typeof values.endpoint === "string" ? values.endpoint : "",
+        host: typeof values.host === "string" ? values.host : undefined,
+        query: values.query && typeof values.query === "object" ? (() => {
+          const entries = Object.entries(values.query);
+          if (entries.some(([, value]) => typeof value !== "string")) throw new GhExecutionError("validation", "API GET query parameters must be strings.");
+          return Object.fromEntries(entries) as Record<string, string>;
+        })() : undefined,
+        page: typeof values.page === "number" ? values.page : undefined,
+        perPage: typeof values.perPage === "number" ? values.perPage : undefined,
+        cache: typeof values.cache === "string" ? values.cache : undefined,
+        jq: typeof values.jq === "string" ? values.jq : undefined,
+        detail: values.detail === "compact" || values.detail === "expanded" ? values.detail : undefined,
+      };
+      const { projection, target } = await pipeline.runApiGet(input, { cwd: ctx.cwd, signal });
       return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
     },
   });
