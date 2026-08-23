@@ -10,6 +10,8 @@ export type ErrorCategory =
   | "validation"
   | "rate_limit"
   | "conflict"
+  | "not_mergeable"
+  | "required_checks"
   | "cancelled"
   | "unsupported";
 
@@ -53,6 +55,8 @@ export function classifyGhFailure(
   if (/resource not accessible|permission denied|HTTP 403|forbidden/i.test(text)) return "permission";
   if (/rate limit|HTTP 429/i.test(text)) return "rate_limit";
   if (/already exists|HTTP 409|conflict/i.test(text)) return "conflict";
+  if (/not mergeable|mergeability/i.test(text)) return "not_mergeable";
+  if (/required (?:status )?checks|checks have not passed|status checks have not passed/i.test(text)) return "required_checks";
   if (result.code !== 0) return undefined;
   return undefined;
 }

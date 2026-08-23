@@ -5,6 +5,7 @@ import {
   type ContentRequestInput,
   type GhDependencies,
   type IssueRequestInput,
+  type PullRequestRequestInput,
   type SearchRequestInput,
 } from "./execute.ts";
 import {
@@ -19,6 +20,13 @@ import {
   issueCommentParameters,
   issueStateParameters,
   jobParameters,
+  createPullRequestParameters,
+  editPullRequestParameters,
+  mergePullRequestParameters,
+  pullRequestCommentParameters,
+  pullRequestOperationKinds,
+  reviewPullRequestParameters,
+  updatePullRequestBranchParameters,
   listDirectoryParameters,
   pullRequestDiffParameters,
   pullRequestFilesParameters,
@@ -30,6 +38,7 @@ import {
   type Operation,
   type CiKind,
   type OperationRegistry,
+  type PullRequestKind,
   type SearchKind,
   viewParameters,
 } from "./registry.ts";
@@ -75,6 +84,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerCiTool(pi, operation, pipeline, ciOperationKinds[operation.name as keyof typeof ciOperationKinds]);
       } else if (operation.name in issueOperationKinds) {
         registerIssueTool(pi, operation, pipeline, issueOperationKinds[operation.name as keyof typeof issueOperationKinds]);
+      } else if (operation.name in pullRequestOperationKinds) {
+        registerPullRequestTool(pi, operation, pipeline, pullRequestOperationKinds[operation.name as keyof typeof pullRequestOperationKinds]);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -304,6 +315,50 @@ function registerIssueTool(pi: ExtensionAPI, operation: Operation, pipeline: Ret
         content: [{ type: "text", text: JSON.stringify(projection) }],
         details: { kind, target },
       };
+    },
+  });
+}
+
+function registerPullRequestTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>, kind: PullRequestKind): void {
+  const schema = operation.name === "gh_create_pull_request"
+    ? createPullRequestParameters
+    : operation.name === "gh_comment_pull_request"
+      ? pullRequestCommentParameters
+      : operation.name === "gh_edit_pull_request"
+        ? editPullRequestParameters
+        : operation.name === "gh_review_pull_request"
+          ? reviewPullRequestParameters
+          : operation.name === "gh_merge_pull_request"
+            ? mergePullRequestParameters
+            : operation.name === "gh_update_pull_request_branch"
+              ? updatePullRequestBranchParameters
+              : issueStateParameters;
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const input: PullRequestRequestInput = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        title: typeof values.title === "string" ? values.title : undefined,
+        body: typeof values.body === "string" ? values.body : undefined,
+        head: typeof values.head === "string" ? values.head : undefined,
+        base: typeof values.base === "string" ? values.base : undefined,
+        draft: typeof values.draft === "boolean" ? values.draft : undefined,
+        reviewers: Array.isArray(values.reviewers) ? values.reviewers.filter((value): value is string => typeof value === "string") : undefined,
+        assignees: Array.isArray(values.assignees) ? values.assignees.filter((value): value is string => typeof value === "string") : undefined,
+        labels: Array.isArray(values.labels) ? values.labels.filter((value): value is string => typeof value === "string") : undefined,
+        event: values.event === "approve" || values.event === "request_changes" || values.event === "comment" ? values.event : undefined,
+        method: values.method === "merge" || values.method === "squash" || values.method === "rebase" ? values.method : undefined,
+        deleteBranch: typeof values.deleteBranch === "boolean" ? values.deleteBranch : undefined,
+      };
+      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
+      const { projection, target } = await pipeline.runPullRequestWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
+      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
     },
   });
 }

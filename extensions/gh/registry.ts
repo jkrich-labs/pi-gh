@@ -217,6 +217,63 @@ export const issueStateParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const createPullRequestParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    title: Type.String({ description: "Pull-request title" }),
+    body: Type.Optional(Type.String({ description: "Pull-request body" })),
+    head: Type.String({ description: "Head branch" }),
+    base: Type.Optional(Type.String({ description: "Base branch" })),
+    draft: Type.Optional(Type.Boolean({ description: "Create as draft" })),
+    reviewers: stringArrayParameter("Reviewers"),
+    assignees: stringArrayParameter("Assignees"),
+    labels: stringArrayParameter("Labels"),
+  },
+  { additionalProperties: false },
+);
+
+export const pullRequestCommentParameters = Type.Object(
+  { target: Type.String({ description: "Pull-request URL or owner/repo#number" }), body: Type.String({ description: "Comment body" }) },
+  { additionalProperties: false },
+);
+
+export const editPullRequestParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    title: Type.Optional(Type.String()),
+    body: Type.Optional(Type.String()),
+    base: Type.Optional(Type.String()),
+    draft: Type.Optional(Type.Boolean()),
+    reviewers: stringArrayParameter("Reviewers to add"),
+    assignees: stringArrayParameter("Assignees to add"),
+    labels: stringArrayParameter("Labels to add"),
+  },
+  { additionalProperties: false },
+);
+
+export const reviewPullRequestParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    event: StringEnum(["approve", "request_changes", "comment"], { description: "Review action" }),
+    body: Type.Optional(Type.String({ description: "Review body" })),
+  },
+  { additionalProperties: false },
+);
+
+export const mergePullRequestParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    method: StringEnum(["merge", "squash", "rebase"], { description: "Merge method" }),
+    deleteBranch: Type.Optional(Type.Boolean({ description: "Delete the head branch after merge" })),
+  },
+  { additionalProperties: false },
+);
+
+export const updatePullRequestBranchParameters = Type.Object(
+  { target: Type.String({ description: "Pull-request URL or owner/repo#number" }) },
+  { additionalProperties: false },
+);
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -575,6 +632,31 @@ export const issueOperations: readonly Operation[] = [
   }),
 ];
 
+export const pullRequestOperationKinds = {
+  gh_create_pull_request: "create_pull_request",
+  gh_comment_pull_request: "comment_pull_request",
+  gh_edit_pull_request: "edit_pull_request",
+  gh_review_pull_request: "review_pull_request",
+  gh_close_pull_request: "close_pull_request",
+  gh_reopen_pull_request: "reopen_pull_request",
+  gh_merge_pull_request: "merge_pull_request",
+  gh_update_pull_request_branch: "update_pull_request_branch",
+} as const;
+
+export type PullRequestOperationName = keyof typeof pullRequestOperationKinds;
+export type PullRequestKind = (typeof pullRequestOperationKinds)[PullRequestOperationName];
+
+export const pullRequestOperations: readonly Operation[] = [
+  writeOperation("routine", { name: "gh_create_pull_request", label: "Create Pull Request", description: "Create a pull request with branches, draft state, reviewers, assignees, and labels.", aliases: ["create pull request", "new pull request", "open pull request"], keywords: ["pull", "request", "create", "draft", "reviewers"], resourceKind: "pull request", verb: "create", parameters: createPullRequestParameters, argvFixture: ["pr", "create", "--repo", "OWNER/REPO", "--title", "Title"], buildArgv: () => ["pr", "create", "--repo", "OWNER/REPO"] }),
+  writeOperation("routine", { name: "gh_comment_pull_request", label: "Comment on Pull Request", description: "Add a comment to a pull request while preserving body data.", aliases: ["comment pull request", "pull request comment", "comment pr"], keywords: ["pull", "request", "comment", "reply"], resourceKind: "pull request", verb: "comment", parameters: pullRequestCommentParameters, argvFixture: ["pr", "comment", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "comment", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("routine", { name: "gh_edit_pull_request", label: "Edit Pull Request", description: "Edit pull-request metadata, body, draft state, reviewers, assignees, and labels.", aliases: ["edit pull request", "pull request metadata", "edit pr"], keywords: ["pull", "request", "edit", "draft", "reviewers", "labels"], resourceKind: "pull request", verb: "edit", parameters: editPullRequestParameters, argvFixture: ["pr", "edit", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "edit", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("guarded", { name: "gh_review_pull_request", label: "Review Pull Request", description: "Submit a pull-request review; approval and request-changes effects require confirmation.", aliases: ["review pull request", "review pr", "approve pull request", "request changes"], keywords: ["pull", "request", "review", "approve", "changes", "comment"], resourceKind: "pull request", verb: "review", parameters: reviewPullRequestParameters, argvFixture: ["pr", "review", "1", "--repo", "OWNER/REPO", "--approve"], buildArgv: () => ["pr", "review", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("guarded", { name: "gh_close_pull_request", label: "Close Pull Request", description: "Close a pull request after confirming the normalized target and lifecycle effect.", aliases: ["close pull request", "close pr"], keywords: ["pull", "request", "close", "lifecycle"], resourceKind: "pull request", verb: "close", parameters: issueStateParameters, argvFixture: ["pr", "close", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "close", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("routine", { name: "gh_reopen_pull_request", label: "Reopen Pull Request", description: "Reopen a pull request using its normalized target.", aliases: ["reopen pull request", "reopen pr"], keywords: ["pull", "request", "reopen", "open"], resourceKind: "pull request", verb: "reopen", parameters: issueStateParameters, argvFixture: ["pr", "reopen", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "reopen", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("guarded", { name: "gh_merge_pull_request", label: "Merge Pull Request", description: "Merge a pull request using a confirmed merge method and optional branch deletion.", aliases: ["merge pull request", "merge pr", "squash pull request"], keywords: ["pull", "request", "merge", "squash", "rebase", "branch"], resourceKind: "pull request", verb: "merge", parameters: mergePullRequestParameters, argvFixture: ["pr", "merge", "1", "--repo", "OWNER/REPO", "--squash"], buildArgv: () => ["pr", "merge", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation("guarded", { name: "gh_update_pull_request_branch", label: "Update Pull Request Branch", description: "Update a pull-request branch after confirming the compute effect.", aliases: ["update pull request branch", "update pr branch", "sync pull request"], keywords: ["pull", "request", "branch", "update", "sync", "compute"], resourceKind: "pull request", verb: "update branch", parameters: updatePullRequestBranchParameters, argvFixture: ["pr", "update-branch", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "update-branch", "1", "--repo", "OWNER/REPO"] }),
+];
+
 export interface OperationRegistry {
   readonly operations: readonly Operation[];
   get(name: string): Operation | undefined;
@@ -583,7 +665,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {

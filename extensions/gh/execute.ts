@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { CiKind, IssueKind, SearchKind } from "./registry.ts";
+import type { CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -83,6 +83,23 @@ export interface IssueRequestInput {
   assignees?: string[];
   labels?: string[];
   milestone?: string;
+}
+
+export interface PullRequestRequestInput {
+  kind: PullRequestKind;
+  repo?: string;
+  target?: string;
+  title?: string;
+  body?: string;
+  head?: string;
+  base?: string;
+  draft?: boolean;
+  reviewers?: string[];
+  assignees?: string[];
+  labels?: string[];
+  event?: "approve" | "request_changes" | "comment";
+  method?: "merge" | "squash" | "rebase";
+  deleteBranch?: boolean;
 }
 
 export interface GhExecRequest {
@@ -419,7 +436,31 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     return { projection, target };
   }
 
-  return { runView, runSearch, runContent, runCi, runIssueWrite, ensureHost };
+  async function runPullRequestWrite(
+    input: PullRequestRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    const target = input.kind === "create_pull_request"
+      ? resolveRepositoryTarget(input.repo ?? "")
+      : resolvePullRequestTarget(input.target ?? "");
+    await ensureGh(ctx.signal);
+    await ensureHost(target.host, ctx.signal);
+    const guarded = input.kind === "close_pull_request" || input.kind === "merge_pull_request" || input.kind === "update_pull_request_branch" || (input.kind === "review_pull_request" && input.event !== "comment");
+    if (guarded) {
+      const ask = ctx.confirm ?? confirm;
+      if (!ctx.hasUI || !ask) throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
+      const approved = await ask("Confirm GitHub write", pullRequestEffect(input, target));
+      if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: pullRequestEffect(input, target) }, target };
+    }
+    const result = await run({ argv: buildPullRequestArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    return {
+      projection: { kind: pullRequestMutationResultKind(input), target, output: result.stdout.trim() },
+      target,
+    };
+  }
+
+  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -919,6 +960,66 @@ function buildIssueArgv(input: IssueRequestInput, target: ResourceTarget): strin
 
 function repeatFlags(flag: string, values: string[] | undefined): string[] {
   return (values ?? []).flatMap((value) => [flag, value]);
+}
+
+function resolvePullRequestTarget(raw: string): Extract<ResourceTarget, { kind: "pull_request" }> {
+  const target = resolveResourceTarget(raw, { kind: "pull_request" });
+  if (target.kind !== "pull_request") throw new GhExecutionError("validation", "A pull-request target is required.");
+  return target;
+}
+
+function pullRequestMutationResultKind(input: PullRequestRequestInput): string {
+  switch (input.kind) {
+    case "create_pull_request": return "pull_request_created";
+    case "comment_pull_request": return "pull_request_commented";
+    case "edit_pull_request": return "pull_request_edited";
+    case "review_pull_request": return "pull_request_reviewed";
+    case "close_pull_request": return "pull_request_closed";
+    case "reopen_pull_request": return "pull_request_reopened";
+    case "merge_pull_request": return "pull_request_merged";
+    case "update_pull_request_branch": return "pull_request_branch_updated";
+    default: return assertNever(input.kind);
+  }
+}
+
+function pullRequestEffect(input: PullRequestRequestInput, target: ResourceTarget): string {
+  const repository = formatRepositoryTarget(target) ?? "repository";
+  const number = target.kind === "pull_request" ? `#${target.number}` : "";
+  if (input.kind === "create_pull_request") return `Create pull request in ${repository}`;
+  if (input.kind === "merge_pull_request") return `Merge pull request ${repository}${number} using ${input.method ?? "merge"}`;
+  if (input.kind === "close_pull_request") return `Close pull request ${repository}${number}`;
+  if (input.kind === "update_pull_request_branch") return `Update pull request branch ${repository}${number}`;
+  if (input.kind === "review_pull_request") return `Submit ${input.event ?? "comment"} review for ${repository}${number}`;
+  return `${input.kind.replace("_pull_request", "")} pull request ${repository}${number}`;
+}
+
+function buildPullRequestArgv(input: PullRequestRequestInput, target: ResourceTarget): string[] {
+  const repository = cliRepositoryTarget(target);
+  if (input.kind === "create_pull_request") {
+    return [
+      "pr", "create", "--repo", repository, "--title", input.title ?? "", ...(input.body !== undefined ? ["--body", input.body] : []),
+      "--head", input.head ?? "", ...(input.base ? ["--base", input.base] : []), ...(input.draft ? ["--draft"] : []),
+      ...repeatFlags("--reviewer", input.reviewers), ...repeatFlags("--assignee", input.assignees), ...repeatFlags("--label", input.labels),
+    ];
+  }
+  const number = targetPullRequestNumber(target);
+  if (input.kind === "comment_pull_request") return ["pr", "comment", String(number), "--repo", repository, "--body", input.body ?? ""];
+  if (input.kind === "edit_pull_request") return [
+    "pr", "edit", String(number), "--repo", repository,
+    ...(input.title !== undefined ? ["--title", input.title] : []), ...(input.body !== undefined ? ["--body", input.body] : []),
+    ...(input.base ? ["--base", input.base] : []), ...(input.draft === true ? ["--draft"] : input.draft === false ? ["--ready"] : []),
+    ...repeatFlags("--add-reviewer", input.reviewers), ...repeatFlags("--add-assignee", input.assignees), ...repeatFlags("--add-label", input.labels),
+  ];
+  if (input.kind === "review_pull_request") return ["pr", "review", String(number), "--repo", repository, `--${input.event === "request_changes" ? "request-changes" : input.event ?? "comment"}`, ...(input.body !== undefined ? ["--body", input.body] : [])];
+  if (input.kind === "merge_pull_request") return ["pr", "merge", String(number), "--repo", repository, `--${input.method ?? "merge"}`, ...(input.deleteBranch ? ["--delete-branch"] : [])];
+  if (input.kind === "close_pull_request") return ["pr", "close", String(number), "--repo", repository];
+  if (input.kind === "reopen_pull_request") return ["pr", "reopen", String(number), "--repo", repository];
+  return ["pr", "update-branch", String(number), "--repo", repository];
+}
+
+function targetPullRequestNumber(target: ResourceTarget): number {
+  if (target.kind !== "pull_request") throw new GhExecutionError("validation", "A pull-request target is required.");
+  return target.number;
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {

@@ -84,6 +84,25 @@ test("gh_find loads exact issue write tools", async () => {
   }
 });
 
+test("gh_find loads exact pull request write tools", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const cases = [
+    ["create pull request", "gh_create_pull_request"],
+    ["comment pull request", "gh_comment_pull_request"],
+    ["edit pull request", "gh_edit_pull_request"],
+    ["review pull request", "gh_review_pull_request"],
+    ["merge pull request", "gh_merge_pull_request"],
+    ["update pull request branch", "gh_update_pull_request_branch"],
+  ] as const;
+  for (const [query, expected] of cases) {
+    const projection = projectionOf(await tool.execute(query, { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+    assert.equal(projection.matches[0]?.name, expected);
+    assert.equal(loaded.activeTools.includes(expected), true);
+  }
+});
+
 test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");
