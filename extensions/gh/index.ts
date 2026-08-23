@@ -111,10 +111,12 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
     }
 
     const searchable = new Set(registry.searchable().map((operation) => operation.name));
-    const active = pi.getActiveTools?.() ?? [];
-    const initial = active.filter((name) => !searchable.has(name));
-    const next = [...new Set([...initial, "gh_view", "gh_find"])];
-    pi.setActiveTools?.(next);
+    pi.on("session_start", () => {
+      const active = pi.getActiveTools?.() ?? [];
+      const initial = active.filter((name) => !searchable.has(name));
+      const next = [...new Set([...initial, "gh_view", "gh_find"])];
+      pi.setActiveTools?.(next);
+    });
   };
 }
 

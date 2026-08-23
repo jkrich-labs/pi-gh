@@ -1,25 +1,25 @@
 [
   {
     "name": "repository URL view",
-    "prompt": "Inspect https://github.com/cli/cli with GitHub tools. Do not use shell tools.",
+    "prompt": "Call gh_view exactly once with target https://github.com/cli/cli, then stop. Do not call gh_find or any other tool.",
     "tools": ["gh_view"],
     "args": {"target": "https://github.com/cli/cli"}
   },
   {
     "name": "focused issue search",
-    "prompt": "Find GitHub issue tools, then search issues in cli/cli for authentication.",
+    "prompt": "Call gh_find for issue search, then call gh_search_issues exactly once for cli/cli and authentication. Stop after that result.",
     "tools": ["gh_find", "gh_search_issues"],
     "args": {"repo": "cli/cli"}
   },
   {
     "name": "uncommon REST read",
-    "prompt": "Find the uncommon REST API read tool, then GET repos/cli/cli/issues with state=open. Do not mutate anything.",
+    "prompt": "Call gh_find for an uncommon REST API read, then call gh_api_get exactly once for repos/cli/cli/issues with state=open. Stop after that result; do not mutate anything.",
     "tools": ["gh_find", "gh_api_get"],
     "args": {"endpoint": "repos/cli/cli/issues"}
   },
   {
     "name": "guarded close",
-    "prompt": "Find the exact issue close operation for cli/cli issue 1, but do not execute it until confirmation.",
+    "prompt": "Call gh_find for issue closure, then call gh_close_issue exactly once for cli/cli#1. It may fail closed because this run has no confirmation UI; do not substitute gh_view.",
     "tools": ["gh_find", "gh_close_issue"],
     "args": {"target": "cli/cli#1"}
   }

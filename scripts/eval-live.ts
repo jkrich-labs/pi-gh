@@ -31,6 +31,9 @@ await writeFile(shim, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args[0] === "--version") { console.log("gh version 2.81.0"); process.exit(0); }
 if (args[0] === "auth" && args[1] === "status") { console.log(JSON.stringify({ hosts: { "github.com": [{ state: "success", active: true }] } })); process.exit(0); }
+if (args[0] === "repo") { console.log(JSON.stringify({ name: "cli", nameWithOwner: "cli/cli", description: "GitHub CLI", url: "https://github.com/cli/cli", visibility: "PUBLIC", isPrivate: false, isFork: false, isArchived: false, stargazerCount: 1, forkCount: 1, primaryLanguage: { name: "Go" }, defaultBranchRef: { name: "trunk" }, repositoryTopics: [], owner: { login: "cli" } })); process.exit(0); }
+if (args[0] === "search") { console.log("[]"); process.exit(0); }
+if (args[0] === "api") { console.log("[]"); process.exit(0); }
 console.log(JSON.stringify({}));
 `, { mode: 0o700 });
 await chmod(shim, 0o700);
@@ -47,10 +50,17 @@ try {
       try { return line ? [JSON.parse(line) as EventRecord] : []; } catch { return []; }
     });
     const calls = events.filter((event) => event.type === "tool_execution_start" && event.toolName);
-    const expectedLast = fixture.tools[fixture.tools.length - 1];
-    const actualLast = calls[calls.length - 1]?.toolName;
-    const targetMatch = fixture.args === undefined || Object.entries(fixture.args).every(([key, value]) => JSON.stringify(calls[calls.length - 1]?.args?.[key]) === JSON.stringify(value));
-    results.push({ name: fixture.name, expectedTools: fixture.tools, actualTools: calls.map((call) => call.toolName), exactOperationAndTarget: actualLast === expectedLast && targetMatch ? 1 : 0, schemaValid: calls.every((call) => Boolean(call.args && typeof call.args === "object")) ? 1 : 0, unsafeWriteMisroutes: 0, exitCode: result.status, stderr: result.stderr.slice(0, 2_000) });
+    let cursor = 0;
+    let finalCall: EventRecord | undefined;
+    let sequenceMatch = true;
+    for (const expected of fixture.tools) {
+      const match = calls.slice(cursor).find((call) => call.toolName === expected);
+      if (!match) { sequenceMatch = false; break; }
+      finalCall = match;
+      cursor = calls.indexOf(match) + 1;
+    }
+    const targetMatch = fixture.args === undefined || Object.entries(fixture.args).every(([key, value]) => JSON.stringify(finalCall?.args?.[key]) === JSON.stringify(value));
+    results.push({ name: fixture.name, expectedTools: fixture.tools, actualTools: calls.map((call) => call.toolName), actualArgs: calls.map((call) => call.args), exactOperationAndTarget: sequenceMatch && targetMatch ? 1 : 0, schemaValid: calls.every((call) => Boolean(call.args && typeof call.args === "object")) ? 1 : 0, unsafeWriteMisroutes: 0, exitCode: result.status, stderr: result.stderr.slice(0, 2_000) });
   }
 } finally {
   await rm(shimDir, { recursive: true, force: true });

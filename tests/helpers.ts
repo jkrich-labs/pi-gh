@@ -117,7 +117,9 @@ export function loadExtension(
       activeTools.splice(0, activeTools.length, ...names);
       activeChanges.push([...names]);
     },
-    on() {},
+    on(event: string, handler: () => void) {
+      if (event === "session_start") handler();
+    },
     exec: async () => {
       throw new Error("pi.exec must not be called when a fake executor is injected");
     },
