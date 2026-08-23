@@ -44,10 +44,8 @@ const PULL_REQUEST_VIEW_EXPANDED_FIELDS = "body,closedAt,mergedAt,mergedBy,merge
 const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,publishedAt,createdAt,url,author";
 const RELEASE_VIEW_EXPANDED_FIELDS = "body,targetCommitish,isImmutable,assets";
 const RELEASE_VIEW_FIELDS_EXTRA = ["isLatest"];
-const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,createdAt,updatedAt,url";
+const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,attempt,createdAt,updatedAt,url";
 const RUN_VIEW_FIELDS_EXTRA = ["workflowDatabaseId"];
-const JOB_VIEW_FIELDS = "databaseId,name,status,conclusion,startedAt,updatedAt,url";
-const JOB_VIEW_FIELDS_EXTRA = ["completedAt", "steps"];
 
 export type ContentKind = "read_file" | "list_directory" | "pr_files" | "pr_diff";
 
@@ -362,7 +360,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     }
     /* Richer fields newer gh versions expose (isLatest, completedAt, ...) are
      * retried once and dropped silently on 2.81.0-like versions. */
-    const extras = viewExtras(target.kind === "current_checkout" ? "repository" : target.kind);
+    const extras = argv.includes("--json") ? viewExtras(target.kind === "current_checkout" ? "repository" : target.kind) : [];
     if (extras.length > 0) {
       const index = argv.indexOf("--json");
       try {
@@ -378,10 +376,14 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       }
     }
     let decoded: unknown;
-    try {
-      decoded = JSON.parse(result.stdout);
-    } catch {
-      throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
+    if (target.kind === "job" || target.kind === "workflow_run") {
+      decoded = decodeCiJson(result, target.kind === "job" ? "view_job" : "view_run", target);
+    } else {
+      try {
+        decoded = JSON.parse(result.stdout);
+      } catch {
+        throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
+      }
     }
     const projection = await budgetProjection(
       target.kind === "file"
@@ -518,7 +520,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     if (input.kind === "failed_logs") {
       projection = projectFailedLogs(result.stdout, target, input.step, clamp(input.maxLines, 500, 1, MAX_LOG_LINES), clamp(input.maxBytes, 100_000, 1, MAX_LOG_BYTES));
     } else {
-      const decoded = decodeJson(result);
+      const decoded = decodeCiJson(result, input.kind, target);
       projection = projectCi(decoded, input.kind, target, page, limit, checksContext);
     }
     return {
@@ -691,7 +693,7 @@ export function buildViewArgv(target: ResourceTarget, detail: "compact" | "expan
     case "workflow_run":
       return ["run", "view", String(target.runId), "--repo", cliRepository, "--json", RUN_VIEW_FIELDS];
     case "job":
-      return ["run", "view", String(target.runId), "--job", String(target.jobId), "--repo", cliRepository, "--json", JOB_VIEW_FIELDS];
+      return actionsJobArgv(target);
     case "file":
       return [
         "api",
@@ -1014,6 +1016,19 @@ function decodeJson(result: GhExecResult): unknown {
   }
 }
 
+function decodeCiJson(result: GhExecResult, kind: Exclude<CiKind, "failed_logs">, target: ResourceTarget): unknown {
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    const output = redactSecrets(result.stdout.trim());
+    const operation = kind === "pr_checks" ? "pull-request checks" : kind === "view_job" ? "workflow job" : kind === "view_run" ? "workflow run" : "workflow runs";
+    if (!output) {
+      throw new GhExecutionError("malformed_json", `GitHub returned an empty response while reading ${operation} for ${describeTarget(target)}. The resource may be unavailable or no checks may have run.`);
+    }
+    throw new GhExecutionError("malformed_json", `GitHub returned non-JSON output while reading ${operation} for ${describeTarget(target)}: ${output.slice(0, 300)}`);
+  }
+}
+
 function decodeUtf8(bytes: Uint8Array): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -1032,6 +1047,17 @@ interface ChecksContext {
   headRefName?: string;
   headRefOid?: string;
   fallbackNote?: string;
+}
+
+function actionsJobArgv(target: Extract<ResourceTarget, { kind: "job" }>): string[] {
+  const repository = formatRepositoryTarget(target)!;
+  return [
+    "api",
+    ...hostnameArgs(target),
+    `repos/${repository}/actions/jobs/${target.jobId}`,
+    "--method",
+    "GET",
+  ];
 }
 
 function waitableCiArgv(input: CiRequestInput, target: ResourceTarget, limit: number, page: number): string[] {
@@ -1067,7 +1093,8 @@ function waitableCiArgv(input: CiRequestInput, target: ResourceTarget, limit: nu
     case "view_run":
       return ["run", "view", String(targetNumberForKind(target, "workflow_run")), "--repo", cliRepository, ...(input.attempt ? ["--attempt", String(input.attempt)] : []), "--json", RUN_VIEW_FIELDS];
     case "view_job":
-      return ["run", "view", String(targetNumberForKind(target, "job_run")), "--job", String(targetJobId(target)), "--repo", cliRepository, "--json", JOB_VIEW_FIELDS];
+      if (target.kind !== "job") throw new GhExecutionError("validation", "A job target is required.");
+      return actionsJobArgv(target);
     case "pr_checks":
       return ["pr", "checks", String(targetNumberForKind(target, "pull_request")), "--repo", cliRepository, "--json", "name,state,bucket,link,workflow" ];
     case "failed_logs":
@@ -1092,14 +1119,17 @@ function projectCi(
       const runs = raw.slice(0, limit).map(compactWorkflowRun);
       return { kind: "workflow_runs", target, page, limit, totalCount: null, filtered: true, runCount: runs.length, runs };
     }
-    if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub workflow-runs JSON was not an object.");
+    if (!raw || typeof raw !== "object" || !Array.isArray((raw as Record<string, unknown>).workflow_runs)) {
+      throw malformedCiProjection(target, "workflow-runs response did not contain a workflow_runs array");
+    }
     const value = raw as Record<string, unknown>;
-    const runs = Array.isArray(value.workflow_runs) ? value.workflow_runs.slice(0, limit).map(compactWorkflowRun) : [];
-    return { kind: "workflow_runs", target, page, limit, totalCount: asNumber(value.total_count), filtered: false, runCount: runs.length, runs };
+    const workflowRuns = value.workflow_runs as unknown[];
+    const runs = workflowRuns.slice(0, limit).map(compactWorkflowRun);
+    return { kind: "workflow_runs", target, page, limit, totalCount: optionalFiniteNumber(value.total_count), filtered: false, runCount: runs.length, runs };
   }
   if (kind === "pr_checks") {
-    if (!checksContext) throw new GhExecutionError("malformed_json", "GitHub checks context was not captured.");
-    if (!Array.isArray(raw)) throw new GhExecutionError("malformed_json", "GitHub checks JSON was not an array.");
+    if (!checksContext) throw malformedCiProjection(target, "checks context was missing");
+    if (!Array.isArray(raw)) throw malformedCiProjection(target, "checks response was not an array");
     const checks = raw.map((entry) => redactUnknown(entry) as Record<string, unknown>);
     const buckets = new Map<string, number>();
     for (const check of checks) {
@@ -1111,7 +1141,10 @@ function projectCi(
     const summary = {
       kind: "pull_request_checks",
       target,
-      ...checksContext,
+      source: checksContext.source,
+      ...(checksContext.headRefName ? { headRefName: redactSecrets(checksContext.headRefName) } : {}),
+      ...(checksContext.headRefOid ? { headRefOid: redactSecrets(checksContext.headRefOid) } : {}),
+      ...(checksContext.fallbackNote ? { fallbackNote: redactSecrets(checksContext.fallbackNote) } : {}),
       checkCount: checks.length,
       failedCount: failures.length,
       pendingCount: pending.length,
@@ -1127,33 +1160,105 @@ function projectCi(
     }
     return summary;
   }
-  if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub CI JSON was not an object.");
-  return { kind: kind === "view_job" ? "job" : "workflow_run", target, ...redactUnknown(raw) as Record<string, unknown> };
+  if (kind === "view_job") {
+    if (target.kind !== "job") throw malformedCiProjection(target, "job target was missing");
+    return projectWorkflowJob(raw, target);
+  }
+  if (target.kind !== "workflow_run") throw malformedCiProjection(target, "workflow-run target was missing");
+  return projectWorkflowRun(raw, target);
 }
 
+function malformedCiProjection(target: ResourceTarget, problem: string): GhExecutionError {
+  return new GhExecutionError("malformed_json", `GitHub returned a malformed CI response for ${describeTarget(target)}: ${problem}.`);
+}
+
+function optionalFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Maps gh's camelCase and Actions REST's snake_case run records to one shape. */
 function compactWorkflowRun(raw: unknown): Record<string, unknown> {
-  if (!raw || typeof raw !== "object") return { value: raw };
-  const value = raw as Record<string, unknown>;
-  const keys = ["databaseId", "id", "name", "workflowName", "workflowDatabaseId", "displayTitle", "status", "conclusion", "event", "headBranch", "headSha", "attempt", "createdAt", "updatedAt", "url", "html_url"];
-  return Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, redactUnknown(value[key])]));
+  const value = resourceRecord(raw);
+  return {
+    databaseId: optionalFiniteNumber(value.databaseId) ?? optionalFiniteNumber(value.id),
+    workflowDatabaseId: optionalFiniteNumber(value.workflowDatabaseId) ?? optionalFiniteNumber(value.workflow_id),
+    workflowName: asString(value.workflowName) ?? asString(value.name),
+    displayTitle: asString(value.displayTitle) ?? asString(value.display_title),
+    status: asString(value.status),
+    conclusion: asString(value.conclusion),
+    event: asString(value.event),
+    headBranch: asString(value.headBranch) ?? asString(value.head_branch),
+    headSha: asString(value.headSha) ?? asString(value.head_sha),
+    attempt: optionalFiniteNumber(value.attempt) ?? optionalFiniteNumber(value.run_attempt),
+    createdAt: asString(value.createdAt) ?? asString(value.created_at),
+    updatedAt: asString(value.updatedAt) ?? asString(value.updated_at),
+    // REST's `url` is an API URL; prefer its browser URL to match gh run list.
+    url: asString(value.html_url) ?? asString(value.url),
+  };
+}
+
+function projectWorkflowRun(raw: unknown, target: Extract<ResourceTarget, { kind: "workflow_run" }>): Record<string, unknown> {
+  const run = compactWorkflowRun(raw);
+  if (run.databaseId !== target.runId) {
+    throw malformedCiProjection(target, "workflow-run response did not identify the requested run ID");
+  }
+  return { kind: "workflow_run", target: { ...target }, ...run };
+}
+
+function projectWorkflowJob(raw: unknown, target: Extract<ResourceTarget, { kind: "job" }>): Record<string, unknown> {
+  const value = resourceRecord(raw);
+  const databaseId = optionalFiniteNumber(value.id) ?? optionalFiniteNumber(value.databaseId);
+  const returnedRunId = optionalFiniteNumber(value.run_id) ?? optionalFiniteNumber(value.runId);
+  const name = asString(value.name);
+  const url = asString(value.html_url) ?? asString(value.url);
+  if (databaseId !== target.jobId || returnedRunId !== target.runId || !name || !url || !Array.isArray(value.steps)) {
+    throw malformedCiProjection(target, "job response did not identify the requested job, run, name, URL, and steps");
+  }
+  const steps = value.steps.map(compactWorkflowJobStep);
+  return {
+    kind: "job",
+    target: { ...target },
+    databaseId,
+    runId: returnedRunId,
+    name,
+    status: asString(value.status),
+    conclusion: asString(value.conclusion),
+    startedAt: asString(value.startedAt) ?? asString(value.started_at),
+    completedAt: asString(value.completedAt) ?? asString(value.completed_at),
+    updatedAt: asString(value.updatedAt) ?? asString(value.updated_at),
+    url,
+    stepCount: steps.length,
+    steps,
+  };
+}
+
+function compactWorkflowJobStep(raw: unknown): Record<string, unknown> {
+  const value = resourceRecord(raw);
+  return {
+    number: optionalFiniteNumber(value.number),
+    name: asString(value.name),
+    status: asString(value.status),
+    conclusion: asString(value.conclusion),
+    startedAt: asString(value.startedAt) ?? asString(value.started_at),
+    completedAt: asString(value.completedAt) ?? asString(value.completed_at),
+  };
+}
+
+interface FailedLogSection {
+  job: string | null;
+  name: string;
+  lines: string[];
 }
 
 function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: string | undefined, maxLines: number, maxBytes: number): Record<string, unknown> {
-  const lines = raw.split(/\r?\n/).filter((line, index, all) => !(index === all.length - 1 && line === ""));
-  const sections: Array<{ name: string; lines: string[] }> = [];
-  let current: { name: string; lines: string[] } | undefined;
-  for (const line of lines) {
-    const heading = /^(.*?)\s*\/\s*(.*?)\s*$/.exec(line);
-    if (heading) {
-      current = { name: heading[2]!.trim(), lines: [] };
-      sections.push(current);
-    } else if (current) {
-      current.lines.push(line);
-    }
-  }
-  const availableSteps = sections.map((section) => section.name);
-  if (sections.length === 0) {
-    if (raw.trim() === "") {
+  const safeRaw = redactSecrets(raw);
+  const safeRequestedStep = requestedStep === undefined ? undefined : redactSecrets(requestedStep);
+  const lines = safeRaw.split(/\r?\n/).filter((line, index, all) => !(index === all.length - 1 && line === ""));
+  const sections = tabDelimitedFailedLogSections(lines);
+  const recognizedSections = sections.length > 0 ? sections : legacyFailedLogSections(lines);
+  const availableSteps = [...new Set(recognizedSections.map((section) => section.name))];
+  if (recognizedSections.length === 0) {
+    if (safeRaw.trim() === "") {
       return {
         kind: "failed_logs",
         target,
@@ -1169,44 +1274,119 @@ function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: s
       kind: "failed_logs",
       target,
       step: null,
-      note: "The --log-failed output had no recognizable step sections.",
+      note: "The --log-failed output had no recognizable failed-step records.",
       availableSteps,
-      rawPreview: redactSecrets(raw.slice(0, 2_000)),
+      rawPreview: safeRaw.slice(0, 2_000),
       log: "",
       lineCount: 0,
       byteCount: 0,
       partial: false,
     };
   }
-  let selected: string[];
-  let step: string;
-  let partial = false;
-  if (requestedStep) {
-    const match = sections.find((section) => section.name.toLowerCase().includes(requestedStep.toLowerCase()));
-    if (!match) {
-      return {
-        kind: "failed_logs",
-        target,
-        step: null,
-        requestedStep,
-        note: `No failed step named "${requestedStep}" in this run.`,
-        availableSteps,
-        log: "",
-        lineCount: 0,
-        byteCount: 0,
-        partial: false,
-      };
+  const selected = safeRequestedStep
+    ? recognizedSections.find((section) => section.name.toLowerCase().includes(safeRequestedStep.toLowerCase()))
+    : recognizedSections.find((section) => !/^unknown step$/i.test(section.name)) ?? recognizedSections[0];
+  if (!selected) {
+    return {
+      kind: "failed_logs",
+      target,
+      step: null,
+      requestedStep: safeRequestedStep,
+      note: `No failed step named "${safeRequestedStep}" in this run.`,
+      availableSteps,
+      log: "",
+      lineCount: 0,
+      byteCount: 0,
+      partial: false,
+    };
+  }
+  const bounded = boundLogLines(selected.lines, maxLines, maxBytes);
+  return {
+    kind: "failed_logs",
+    target,
+    ...(selected.job ? { job: selected.job } : {}),
+    step: selected.name,
+    availableSteps,
+    log: bounded.log,
+    lineCount: bounded.lineCount,
+    byteCount: Buffer.byteLength(bounded.log),
+    partial: bounded.partial,
+  };
+}
+
+function tabDelimitedFailedLogSections(lines: string[]): FailedLogSection[] {
+  const sections = new Map<string, FailedLogSection>();
+  for (const line of lines) {
+    const fields = line.split("\t");
+    const [job, step, timestampOrRecord, ...remainingMessage] = fields;
+    if (!job || !step || !timestampOrRecord) continue;
+    const record = timestampOrRecord.replace(/^\uFEFF/, "");
+    const directTimestamp = isFailedLogTimestamp(record) ? record : undefined;
+    const timestampMatch = directTimestamp ? undefined : /^(\S+)(?:\s(.*))?$/.exec(record);
+    const timestamp = directTimestamp ?? timestampMatch?.[1];
+    if (!timestamp || !isFailedLogTimestamp(timestamp)) continue;
+    const message = directTimestamp
+      ? remainingMessage.join("\t")
+      : [timestampMatch?.[2] ?? "", ...remainingMessage].join("\t");
+    const key = `${job}\u0000${step}`;
+    const section = sections.get(key) ?? { job, name: step, lines: [] };
+    section.lines.push(`${timestamp}${message ? ` ${message}` : ""}`);
+    sections.set(key, section);
+  }
+  return [...sections.values()];
+}
+
+function isFailedLogTimestamp(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function legacyFailedLogSections(lines: string[]): FailedLogSection[] {
+  const sections: FailedLogSection[] = [];
+  let current: FailedLogSection | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const heading = strictLegacyFailedLogHeading(line);
+    const nextLine = lines[index + 1];
+    if (heading && nextLine && /^\d{4}-\d{2}-\d{2}T/.test(nextLine)) {
+      current = { job: heading.job, name: heading.step, lines: [] };
+      sections.push(current);
+    } else if (current) {
+      current.lines.push(line);
     }
-    selected = match.lines;
-    step = match.name;
-  } else {
-    selected = lines;
-    step = sections[0]?.name ?? "FAILED STEPS";
   }
-  if (selected.length > maxLines) {
-    selected = selected.slice(0, maxLines);
-    partial = true;
-  }
+  return sections;
+}
+
+function strictLegacyFailedLogHeading(line: string): { job: string; step: string } | undefined {
+  const match = /^([^/\t\r\n]+?)\s+\/\s+([^/\t\r\n]+?)\s*$/.exec(line);
+  if (!match) return undefined;
+  const job = match[1]!.trim();
+  const step = match[2]!.trim();
+  if (!isLegacyFailedLogLabel(job) || !isLegacyFailedLogLabel(step)) return undefined;
+  return { job, step };
+}
+
+function isLegacyFailedLogLabel(value: string): boolean {
+  const firstWord = /^[A-Za-z0-9_.+-]+/.exec(value)?.[0] ?? "";
+  const shellCommands = new Set([
+    "npm", "pnpm", "yarn", "node", "bash", "sh", "zsh", "fish", "python", "python3", "go", "git", "make",
+    "echo", "printf", "cd", "pwd", "ls", "cat", "touch", "rm", "rmdir", "mkdir", "mv", "cp", "ln", "chmod", "chown",
+    "find", "grep", "sed", "awk", "head", "tail", "sort", "uniq", "cut", "tr", "xargs", "tee", "env", "export", "source",
+    "curl", "wget", "tar", "zip", "unzip", "docker", "podman", "kubectl", "helm", "tsc", "jest", "vitest", "pytest",
+    "cargo", "gradle", "mvn", "whoami", "date", "sleep", "kill", "true", "false",
+  ]);
+  return Boolean(value)
+    && !/[\\`$;|&<>]/.test(value)
+    && !/(?:^|\s)--?[A-Za-z0-9]/.test(value)
+    && !shellCommands.has(firstWord.toLowerCase())
+    // Multi-word fallback labels must be title-like. This deliberately rejects
+    // ambiguous lowercase command lines rather than mislabelling log content.
+    && (!value.includes(" ") || /^[A-Z0-9]/.test(value));
+}
+
+function boundLogLines(lines: string[], maxLines: number, maxBytes: number): { log: string; lineCount: number; partial: boolean } {
+  const selected = lines.slice(0, maxLines);
+  let partial = lines.length > selected.length;
   const bounded: string[] = [];
   let bytes = 0;
   for (const line of selected) {
@@ -1220,7 +1400,7 @@ function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: s
   }
   const log = bounded.join("\n");
   if (bounded.length < selected.length) partial = true;
-  return { kind: "failed_logs", target, step, availableSteps, log, lineCount: bounded.length, byteCount: Buffer.byteLength(log), partial };
+  return { log, lineCount: bounded.length, partial };
 }
 
 function ciSummaryKeys(kind: CiKind): readonly string[] {
@@ -1239,16 +1419,10 @@ function ciSummaryKeys(kind: CiKind): readonly string[] {
   }
 }
 
-function targetNumberForKind(target: ResourceTarget, kind: "workflow_run" | "job_run" | "pull_request"): number {
+function targetNumberForKind(target: ResourceTarget, kind: "workflow_run" | "pull_request"): number {
   if (kind === "workflow_run" && target.kind === "workflow_run") return target.runId;
-  if (kind === "job_run" && target.kind === "job") return target.runId;
   if (kind === "pull_request" && target.kind === "pull_request") return target.number;
   throw new GhExecutionError("validation", "The resource target kind does not match the CI operation.");
-}
-
-function targetJobId(target: ResourceTarget): number {
-  if (target.kind !== "job") throw new GhExecutionError("validation", "A job target is required.");
-  return target.jobId;
 }
 
 function targetRunId(target: ResourceTarget): number {
@@ -1552,7 +1726,7 @@ function viewExtras(kind: ViewResourceKind): string[] {
     case "workflow_run":
       return RUN_VIEW_FIELDS_EXTRA;
     case "job":
-      return JOB_VIEW_FIELDS_EXTRA;
+      return [];
     default:
       return [];
   }
@@ -1679,6 +1853,21 @@ async function pullRequestWriteDetails(
   return base;
 }
 
+function isJsonArray(value: string): boolean {
+  try {
+    return Array.isArray(JSON.parse(value));
+  } catch {
+    return false;
+  }
+}
+
+function isPlainNoChecksOutput(result: GhExecResult): boolean {
+  const stdout = result.stdout.trim();
+  if (stdout !== "" && isJsonArray(stdout)) return false;
+  if (result.code === 0) return /no checks reported/i.test(stdout);
+  return /no checks reported/i.test(`${result.stderr}\n${stdout}`);
+}
+
 /** Runs CI reads with pr_checks fallback to the head commit's check-runs. */
 async function runChecks(
   input: CiRequestInput,
@@ -1700,8 +1889,9 @@ async function runChecks(
       stdout: boundedDiagnostics(rawFirst).stdout,
       stderr: boundedDiagnostics(rawFirst).stderr,
     };
-    const noChecks = /no checks reported/i.test(first.stderr) || (first.code !== 0 && first.stdout === "");
-    if (!noChecks) {
+    const noChecks = isPlainNoChecksOutput(first);
+    const pendingChecks = first.code === 8 && isJsonArray(first.stdout);
+    if (!noChecks && !pendingChecks) {
       const category = classifyGhFailure(first, ctx.signal);
       if (category || first.code !== 0) {
         throw new GhExecutionError(
@@ -1758,7 +1948,9 @@ async function runChecks(
         }
       }
     }
-    return { result: first, checksContext: { source: "head-branch" } };
+    return noChecks
+      ? { result: { ...first, stdout: "[]" }, checksContext: { source: "head-branch" } }
+      : { result: pendingChecks ? { ...first, code: 0 } : first, checksContext: { source: "head-branch" } };
   }
   if (input.kind === "list_runs") {
     return { result: await executing(waitableCiArgv(input, target, limit, page)) };
@@ -1796,6 +1988,8 @@ export function projectRepository(raw: unknown): Record<string, unknown> {
 
 export function projectResource(raw: unknown, target: ResourceTarget, expanded = false): Record<string, unknown> {
   if (target.kind === "repository" || target.kind === "current_checkout") return projectRepository(raw);
+  if (target.kind === "workflow_run") return projectWorkflowRun(raw, target);
+  if (target.kind === "job") return projectWorkflowJob(raw, target);
   const value = requiredResourceRecord(raw, `GitHub ${target.kind}`);
   assertResourceShape(value, target);
   switch (target.kind) {
@@ -1811,9 +2005,6 @@ export function projectResource(raw: unknown, target: ResourceTarget, expanded =
       return projectRelease(value, target, expanded);
     case "tree":
       return projectTree(value, target, expanded);
-    case "workflow_run":
-    case "job":
-      return { kind: target.kind, target: { ...target }, data: redactUnknown(raw) };
     case "file":
       throw new GhExecutionError("validation", "File views must use the file projector.");
     default:
@@ -1872,8 +2063,10 @@ function assertResourceShape(value: Record<string, unknown>, target: Exclude<Res
       if (!Array.isArray(value.tree)) malformed("its tree entries");
       return;
     case "workflow_run":
+      if (!positiveFiniteNumber(value.databaseId) && !positiveFiniteNumber(value.id)) malformed("its database ID");
+      return;
     case "job":
-      if (!positiveFiniteNumber(value.databaseId)) malformed("its database ID");
+      if (!positiveFiniteNumber(value.databaseId) && !positiveFiniteNumber(value.id)) malformed("its database ID");
       return;
     case "file":
       return;

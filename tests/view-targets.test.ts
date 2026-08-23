@@ -70,7 +70,15 @@ test("the model-facing gh_view accepts every supported URL resource kind", async
     ["https://github.com/cli/cli/commit/abc123", { sha: "abc123", commit: { message: "Commit" } }],
     ["https://github.com/cli/cli/releases/tag/v2.81.0", { tagName: "v2.81.0" }],
     ["https://github.com/cli/cli/actions/runs/100", { databaseId: 100 }],
-    ["https://github.com/cli/cli/actions/runs/100/job/200", { databaseId: 200 }],
+    ["https://github.com/cli/cli/actions/runs/100/job/200", {
+      id: 200,
+      run_id: 100,
+      name: "test",
+      status: "completed",
+      conclusion: "failure",
+      html_url: "https://github.com/cli/cli/actions/runs/100/job/200",
+      steps: [],
+    }],
     ["https://github.com/cli/cli/blob/trunk/README.md", { type: "file", content: "README" }],
     ["https://github.com/cli/cli/tree/trunk/docs", { sha: "tree", tree: [] }],
     ["https://github.com/cli/cli/compare/main...feature", { status: "ahead", base_commit: { sha: "main" }, commits: [], files: [] }],
@@ -82,7 +90,7 @@ test("the model-facing gh_view accepts every supported URL resource kind", async
       : argv.startsWith("pr ") ? fixtures[1]
         : argv.includes("commits/abc123") ? fixtures[2]
           : argv.startsWith("release ") ? fixtures[3]
-            : argv.startsWith("run ") && argv.includes("--job") ? fixtures[5]
+            : argv.includes("actions/jobs/200") ? fixtures[5]
               : argv.startsWith("run ") ? fixtures[4]
                 : argv.includes("contents/") ? fixtures[6]
                   : argv.includes("git/trees/") ? fixtures[7]

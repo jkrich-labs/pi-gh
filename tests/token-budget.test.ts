@@ -58,6 +58,39 @@ test("resource view compact and expanded projections stay within their result bu
   }
 });
 
+test("CI job projections stay within compact and expanded result budgets", async () => {
+  const job = {
+    id: 200,
+    run_id: 100,
+    name: "large job",
+    status: "completed",
+    conclusion: "failure",
+    html_url: "https://github.com/cli/cli/actions/runs/100/job/200",
+    steps: Array.from({ length: 500 }, (_, index) => ({
+      number: index + 1,
+      name: `large step ${index} `.repeat(100),
+      status: "completed",
+      conclusion: index === 499 ? "failure" : "success",
+    })),
+  };
+  const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+    ? { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false }
+    : { stdout: JSON.stringify(job), stderr: "", code: 0, killed: false });
+  const loaded = loadExtension({ executor: executor.execute });
+  const tool = loaded.tools.get("gh_view_job");
+  assert.ok(tool);
+  for (const [detail, budget] of [["compact", 2_000], ["expanded", 8_000]] as const) {
+    const projection = projectionOf(await tool.execute(
+      "ci-job-budget",
+      { target: "https://github.com/cli/cli/actions/runs/100/job/200", detail },
+      undefined,
+      undefined,
+      toolCtx() as never,
+    ));
+    assert.ok(estimateProjectionTokens(JSON.stringify(projection)) <= budget);
+  }
+});
+
 test("CI projections stay within compact and expanded result budgets", async () => {
   const runs = Array.from({ length: 50 }, (_, index) => ({
     databaseId: index,

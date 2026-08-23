@@ -636,8 +636,8 @@ export const ciOperations: readonly Operation[] = [
     resourceKind: "job",
     verb: "view",
     parameters: jobParameters,
-    argvFixture: ["run", "view", "1", "--job", "2", "--json"],
-    buildArgv: () => ["run", "view", "1", "--job", "2", "--json"],
+    argvFixture: ["api", "repos/OWNER/REPO/actions/jobs/2", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/actions/jobs/2", "--method", "GET"],
   }),
   readOperation({
     name: "gh_pr_checks",

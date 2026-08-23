@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { GhExecutionError } from "../extensions/gh/index.ts";
+import { FAILED_LOG_TAB_DELIMITED_FIXTURE } from "./fixtures/ci-live-format.ts";
 import { createFakeExecutor, loadExtension, projectionOf, toolCtx } from "./helpers.ts";
 
 function version() {
@@ -43,8 +44,74 @@ test("failed logs select a failed step and obey line and byte bounds", async () 
   assert.ok(request.argv.includes("--log-failed"));
 });
 
+test("failed logs parse gh's live tab-delimited job, step, timestamp, and message format", async () => {
+  const { tool } = loadLogs({ stdout: FAILED_LOG_TAB_DELIMITED_FIXTURE, stderr: "", code: 0, killed: false });
+  const result = await tool.execute(
+    "logs-tab-format",
+    { target: "https://github.com/cli/cli/actions/runs/100", maxLines: 1 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const projection = projectionOf(result) as { job: string; step: string; log: string; lineCount: number; partial: boolean };
+  assert.equal(projection.job, "test (node 24)");
+  assert.equal(projection.step, "Run tests");
+  assert.match(projection.log, /2026-01-01T00:00:03.000Z # npm test/);
+  assert.doesNotMatch(projection.log, /publish failed/);
+  assert.equal(projection.lineCount, 1);
+  assert.equal(projection.partial, true);
+});
+
+test("failed logs only use strict spaced legacy headings, never paths or commands", async () => {
+  const output = [
+    "packages/foo/test",
+    "npm test ./...",
+    "echo result / failure",
+    "ls -la / failure",
+    "cat output / failure",
+    "build / touch sentinel",
+    "build / test",
+    "2026-01-01T00:00:00Z real failure",
+  ].join("\n");
+  const { tool } = loadLogs({ stdout: output, stderr: "", code: 0, killed: false });
+  const result = await tool.execute(
+    "logs-legacy-heading",
+    { target: "https://github.com/cli/cli/actions/runs/100", step: "test" },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const projection = projectionOf(result) as { step: string; availableSteps: string[]; log: string };
+  assert.equal(projection.step, "test");
+  assert.deepEqual(projection.availableSteps, ["test"]);
+  assert.match(projection.log, /real failure/);
+  assert.doesNotMatch(projection.log, /packages\/foo|ls -la|cat output|touch sentinel/);
+});
+
+test("failed logs prefer a named failed step and redact secrets from labels and lines", async () => {
+  const token = "ghp_exampleSecretTokenValue1234567890";
+  const output = [
+    `job-${token}\tUNKNOWN STEP\t2026-01-01T00:00:00Z setup ${token}`,
+    `job-${token}\tRun tests ${token}\t2026-01-01T00:00:01Z failure ${token}`,
+  ].join("\n");
+  const { tool } = loadLogs({ stdout: output, stderr: "", code: 0, killed: false });
+  const result = await tool.execute(
+    "logs-redacted",
+    { target: "https://github.com/cli/cli/actions/runs/100" },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const projection = projectionOf(result) as { job: string; step: string; availableSteps: string[]; log: string };
+  assert.equal(projection.step, "Run tests [redacted]");
+  assert.equal(projection.job, "job-[redacted]");
+  assert.match(projection.log, /failure \[redacted\]/);
+  assert.doesNotMatch(JSON.stringify(projection), /ghp_/);
+  assert.deepEqual(projection.availableSteps, ["UNKNOWN STEP", "Run tests [redacted]"]);
+});
+
 test("failed logs distinguish step-not-found from a clean run", async () => {
-  const { tool } = loadLogs({ stdout: "build / test\nfailed\n", stderr: "", code: 0, killed: false });
+  const { tool } = loadLogs({ stdout: "build / test\n2026-01-01T00:00:00Z failed\n", stderr: "", code: 0, killed: false });
   const result = await tool.execute(
     "logs-2",
     { target: "https://github.com/cli/cli/actions/runs/100", step: "missing" },

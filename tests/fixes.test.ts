@@ -67,7 +67,7 @@ test("gh_pr_checks falls back to head-commit check-runs when the head branch is 
     // `gh pr checks` on the deleted branch fails with the ga's "no checks" message.
     () => ({ stdout: "", stderr: "no checks reported on the 'gh-pr' branch", code: 1, killed: false }),
     // GraphQL resolver returns the head oid.
-    () => json({ data: { repository: { pullRequest: { number: 1, headRefName: "gh-pr", headRefOid: "abc123", state: "MERGED" } } } }),
+    () => json({ data: { repository: { pullRequest: { number: 1, headRefName: "ghp_exampleSecretTokenValue1234567890", headRefOid: "abc123", state: "MERGED" } } } }),
     // check-runs for the head commit.
     () => json({ check_runs: [{ name: "build", conclusion: "success", html_url: "https://github.com/cli/cli/runs/1" }] }),
   ]);
@@ -78,8 +78,68 @@ test("gh_pr_checks falls back to head-commit check-runs when the head branch is 
   const projection = projectionOf(result) as { source: string; headRefOid: string; checkCount: number; checks: Array<{ name: string }> };
   assert.equal(projection.source, "head-commit");
   assert.equal(projection.headRefOid, "abc123");
+  assert.equal((projection as unknown as { headRefName: string }).headRefName, "[redacted]");
   assert.equal(projection.checkCount, 1);
   assert.equal(projection.checks[0]?.name, "build");
+});
+
+test("gh_pr_checks preserves pending JSON checks returned with gh exit code 8", async () => {
+  const checks = [{ name: "No checks reported by pending bot", state: "IN_PROGRESS", bucket: "pending" }];
+  const executor = scripted([
+    () => ({ stdout: JSON.stringify(checks), stderr: "", code: 8, killed: false }),
+  ]);
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_pr_checks");
+  assert.ok(tool);
+  const result = await tool.execute("checks-pending", { target: "https://github.com/cli/cli/pull/1" }, undefined, undefined, toolCtx() as never);
+  const projection = projectionOf(result) as { pendingCount: number; checks: Array<{ state: string }> };
+  assert.equal(projection.pendingCount, 1);
+  assert.equal(projection.checks[0]?.state, "IN_PROGRESS");
+});
+
+test("gh_pr_checks does not mistake a JSON check name for plain no-check output", async () => {
+  const checks = [{ name: "No checks reported by friendly bot", state: "SUCCESS", bucket: "pass" }];
+  const executor = scripted([() => json(checks)]);
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_pr_checks");
+  assert.ok(tool);
+  const result = await tool.execute("checks-phrase", { target: "https://github.com/cli/cli/pull/1" }, undefined, undefined, toolCtx() as never);
+  const projection = projectionOf(result) as { checkCount: number; checks: Array<{ name: string }> };
+  assert.equal(projection.checkCount, 1);
+  assert.equal(projection.checks[0]?.name, checks[0]!.name);
+  assert.equal(executor.calls.filter((call) => call.argv[0] === "api").length, 0);
+});
+
+test("gh_pr_checks preserves missing-PR errors instead of treating them as no checks", async () => {
+  const executor = scripted([
+    () => ({ stdout: "", stderr: "GraphQL: Could not resolve to a PullRequest with the number of 999.", code: 1, killed: false }),
+  ]);
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_pr_checks");
+  assert.ok(tool);
+  await assert.rejects(
+    () => tool.execute("checks-missing", { target: "https://github.com/cli/cli/pull/999" }, undefined, undefined, toolCtx() as never),
+    (error: unknown) => error instanceof GhExecutionError
+      && error.category === "not_found"
+      && /cli\/cli pull request #999/.test(error.message),
+  );
+  assert.equal(executor.calls.filter((call) => call.argv[0] === "api").length, 0);
+});
+
+test("gh_pr_checks turns exit-0 plain no-check output into a contextual empty projection", async () => {
+  const executor = scripted([
+    () => ({ stdout: "no checks reported on the 'gh-pr' branch\n", stderr: "", code: 0, killed: false }),
+    () => json({ data: { repository: { pullRequest: { number: 1, headRefName: "gh-pr", headRefOid: undefined, state: "MERGED" } } } }),
+  ]);
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_pr_checks");
+  assert.ok(tool);
+  const result = await tool.execute("checks-empty", { target: "https://github.com/cli/cli/pull/1" }, undefined, undefined, toolCtx() as never);
+  const projection = projectionOf(result) as { empty: boolean; checkCount: number; note: string; source: string };
+  assert.equal(projection.source, "head-branch");
+  assert.equal(projection.empty, true);
+  assert.equal(projection.checkCount, 0);
+  assert.match(projection.note, /No checks are reported/);
 });
 
 test("gh_list_workflow_runs routes filtered listings to gh run list", async () => {

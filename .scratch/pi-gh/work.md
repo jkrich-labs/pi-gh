@@ -184,10 +184,10 @@
 - **Tier:** general — output-format compatibility and fallback behaviour require coordinated tests and implementation.
 - **Est. cost:** ~16k tokens / 30–45 minutes
 - **Acceptance criteria:**
-  - [ ] `node --test tests/ci.test.ts tests/ci-logs.test.ts tests/fixes.test.ts tests/regression-hardening.test.ts --test-name-pattern='job|failed logs|checks|workflow'` passes.
-  - [ ] `node --test tests/token-budget.test.ts --test-name-pattern='CI'` passes.
-  - [ ] `npm run typecheck` passes.
-- **Status:** ready
+  - [x] `node --test tests/ci.test.ts tests/ci-logs.test.ts tests/fixes.test.ts tests/regression-hardening.test.ts --test-name-pattern='job|failed logs|checks|workflow'` passes.
+  - [x] `node --test tests/token-budget.test.ts --test-name-pattern='CI'` passes.
+  - [x] `npm run typecheck` passes.
+- **Status:** done
 
 ## S-12 — Make capability discovery intent-safe
 
