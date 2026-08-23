@@ -4,11 +4,12 @@ import { randomBytes } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
+import { classifyGhFailure, describeFailure, describeFailureWithContext, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
 import type { ActionReleaseKind, ApiKind, CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
+  isGithubHost,
   normalizeHost,
   resolveResourceTarget,
   type ResourceTarget,
@@ -19,11 +20,13 @@ export const MIN_GH_VERSION = "2.81.0";
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_TOKEN_BUDGET = 2_000;
 export const EXPANDED_TOKEN_BUDGET = 8_000;
-export const DEFAULT_SEARCH_LIMIT = 10;
+export const DEFAULT_RESULT_LIMIT = 10;
+export const DEFAULT_SEARCH_LIMIT = DEFAULT_RESULT_LIMIT;
 export const MAX_SEARCH_LIMIT = 50;
 export const MAX_SEARCH_PAGE = 10;
-export const DEFAULT_PR_FILES_LIMIT = 30;
-export const DEFAULT_WORKFLOW_RUN_LIMIT = 20;
+export const MAX_RESULT_PAGE = MAX_SEARCH_PAGE;
+export const DEFAULT_PR_FILES_LIMIT = DEFAULT_RESULT_LIMIT;
+export const DEFAULT_WORKFLOW_RUN_LIMIT = DEFAULT_RESULT_LIMIT;
 export const MAX_LOG_LINES = 10_000;
 export const MAX_LOG_BYTES = 1_000_000;
 export const MAX_API_RESPONSE_BYTES = 1_000_000;
@@ -36,9 +39,12 @@ export const REPO_VIEW_FIELDS =
 
 const ISSUE_VIEW_FIELDS = "number,title,state,author,assignees,labels,createdAt,updatedAt,url";
 const PULL_REQUEST_VIEW_FIELDS = "number,title,state,isDraft,author,assignees,labels,baseRefName,headRefName,mergeStateStatus,createdAt,updatedAt,url";
-const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,isLatest,publishedAt,createdAt,url,author";
+const RELEASE_VIEW_FIELDS = "name,tagName,isDraft,isPrerelease,publishedAt,createdAt,url,author";
+const RELEASE_VIEW_FIELDS_EXTRA = ["isLatest"];
 const RUN_VIEW_FIELDS = "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,createdAt,updatedAt,url";
-const JOB_VIEW_FIELDS = "databaseId,name,status,conclusion,startedAt,completedAt,url,steps";
+const RUN_VIEW_FIELDS_EXTRA = ["workflowDatabaseId"];
+const JOB_VIEW_FIELDS = "databaseId,name,status,conclusion,startedAt,updatedAt,url";
+const JOB_VIEW_FIELDS_EXTRA = ["completedAt", "steps"];
 
 export type ContentKind = "read_file" | "list_directory" | "pr_files" | "pr_diff";
 
@@ -105,6 +111,14 @@ export interface PullRequestRequestInput {
   event?: "approve" | "request_changes" | "comment";
   method?: "merge" | "squash" | "rebase";
   deleteBranch?: boolean;
+}
+
+export interface ResolvedPullRequest {
+  kind: "PullRequest";
+  number: number;
+  headRefName: string | null;
+  headRefOid?: string;
+  state?: string;
 }
 
 export interface ActionReleaseRequestInput {
@@ -244,7 +258,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     }
   }
 
-  async function run(request: GhExecRequest): Promise<GhExecResult> {
+  async function run(request: GhExecRequest, targetDescription?: string, hint?: string): Promise<GhExecResult> {
     throwIfAborted(request.signal);
     let result: GhExecResult;
     try {
@@ -264,15 +278,19 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     const diagnostic = boundedDiagnostics(result);
     const category = classifyGhFailure(diagnostic, request.signal);
     if (category) {
-      throw new GhExecutionError(category, describeFailure(category, diagnostic), {
+      const describe = targetDescription ? describeFailureWithContext : describeFailure;
+      throw new GhExecutionError(category, describe(category, diagnostic, targetDescription ?? "", hint), {
         stderr: diagnostic.stderr,
         code: diagnostic.code,
+        target: targetDescription ? redactSecrets(targetDescription) : undefined,
       });
     }
     if (result.code !== 0) {
-      throw new GhExecutionError("unsupported", describeFailure("unsupported", diagnostic), {
+      const describe = targetDescription ? describeFailureWithContext : describeFailure;
+      throw new GhExecutionError("unsupported", describe("unsupported", diagnostic, targetDescription ?? "", hint), {
         stderr: diagnostic.stderr,
         code: diagnostic.code,
+        target: targetDescription ? redactSecrets(targetDescription) : undefined,
       });
     }
     return result;
@@ -287,12 +305,47 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     await ensureGh(ctx.signal);
     if (target.kind !== "current_checkout") await ensureHost(target.host, ctx.signal);
 
-    const result = await run({
-      argv: buildViewArgv(target),
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      timeout: DEFAULT_TIMEOUT_MS,
-    });
+    let argv = buildViewArgv(target);
+    /* First attempt is wrapped so gh 2.81.0's `Unknown JSON field` failure can
+     * drive field removal instead of surfacing as a hard error. */
+    let raw: GhExecResult;
+    try {
+      raw = await run({ argv, cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target), viewFallbackHint(target));
+    } catch (error) {
+      if (error instanceof GhExecutionError && error.category === "unsupported" && parseUnknownJsonField(String(error.details.stderr ?? ""))) {
+        raw = { stdout: "", stderr: String(error.details.stderr), code: 1, killed: false };
+      } else {
+        throw error;
+      }
+    }
+    let result = raw;
+    let fieldList = jsonFieldList(argv);
+    while (fieldList.length > 0) {
+      const unknown = parseUnknownJsonField(result.stderr);
+      if (!unknown) break;
+      fieldList = fieldList.filter((field) => field !== unknown);
+      const index = argv.indexOf("--json");
+      argv = [...argv];
+      argv[index + 1] = fieldList.join(",");
+      result = await run({ argv, cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target), viewFallbackHint(target));
+    }
+    /* Richer fields newer gh versions expose (isLatest, completedAt, ...) are
+     * retried once and dropped silently on 2.81.0-like versions. */
+    const extras = viewExtras(target.kind === "current_checkout" ? "repository" : target.kind);
+    if (extras.length > 0) {
+      const index = argv.indexOf("--json");
+      try {
+        const enhanced = await run({
+          argv: [...argv.slice(0, index + 1), [...jsonFieldList(argv), ...extras].join(",")],
+          cwd: ctx.cwd,
+          signal: ctx.signal,
+          timeout: DEFAULT_TIMEOUT_MS,
+        }, describeTarget(target), viewFallbackHint(target));
+        if (!parseUnknownJsonField(enhanced.stderr)) result = enhanced;
+      } catch {
+        /* Older gh can't render the extras; the base view already succeeded. */
+      }
+    }
     let decoded: unknown;
     try {
       decoded = JSON.parse(result.stdout);
@@ -300,7 +353,9 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
     }
     const projection = await budgetProjection(
-      projectResource(decoded, target),
+      target.kind === "file"
+        ? projectFile(decoded, target, target.path, target.ref)
+        : projectResource(decoded, target),
       input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
       tempOutput,
     );
@@ -314,7 +369,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     throwIfAborted(ctx.signal);
     const target = input.repo ? resolveRepositoryTarget(input.repo) : undefined;
     const limit = clamp(input.limit, DEFAULT_SEARCH_LIMIT, 1, MAX_SEARCH_LIMIT);
-    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const page = clamp(input.page, 1, 1, MAX_RESULT_PAGE);
     if (!input.query.trim()) throw new GhExecutionError("validation", "Search query must not be empty.");
     await ensureGh(ctx.signal);
     if (target) await ensureHost(target.host, ctx.signal);
@@ -323,7 +378,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       cwd: ctx.cwd,
       signal: ctx.signal,
       timeout: DEFAULT_TIMEOUT_MS,
-    });
+    }, target ? describeTarget(target) : "github.com search");
     const decoded = decodeJson(result);
     const projection = projectSearch(decoded, input.kind, input.query, page, limit, input.detail === "expanded");
     return {
@@ -362,13 +417,13 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       1,
       MAX_SEARCH_LIMIT,
     );
-    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const page = clamp(input.page, 1, 1, MAX_RESULT_PAGE);
     const result = await run({
       argv: buildContentArgv(input, target, limit, page),
       cwd: ctx.cwd,
       signal: ctx.signal,
       timeout: DEFAULT_TIMEOUT_MS,
-    });
+    }, describeTarget(target), readFileNotFoundHint(input, target));
     const projection =
       input.kind === "pr_diff"
         ? projectPullRequestDiff(result.stdout, target)
@@ -417,19 +472,23 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     await ensureGh(ctx.signal);
     await ensureHost(target.host, ctx.signal);
     const limit = clamp(input.limit, DEFAULT_WORKFLOW_RUN_LIMIT, 1, MAX_SEARCH_LIMIT);
-    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
-    const result = await run({
-      argv: buildCiArgv(input, target, limit, page),
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      timeout: DEFAULT_TIMEOUT_MS,
-    });
+    const page = clamp(input.page, 1, 1, MAX_RESULT_PAGE);
+    const { result, checksContext } = await runChecks(
+      input,
+      target,
+      limit,
+      page,
+      ctx,
+      async (argv: string[]) =>
+        run({ argv, cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target), ciRunHint(input, target)),
+      deps.executor,
+    );
     let projection: Record<string, unknown>;
     if (input.kind === "failed_logs") {
       projection = projectFailedLogs(result.stdout, target, input.step, clamp(input.maxLines, 500, 1, MAX_LOG_LINES), clamp(input.maxBytes, 100_000, 1, MAX_LOG_BYTES));
     } else {
       const decoded = decodeJson(result);
-      projection = projectCi(decoded, input.kind, target, page, limit);
+      projection = projectCi(decoded, input.kind, target, page, limit, checksContext);
     }
     return {
       projection: await budgetProjection(
@@ -469,10 +528,11 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       cwd: ctx.cwd,
       signal: ctx.signal,
       timeout: DEFAULT_TIMEOUT_MS,
-    });
+    }, describeTarget(target));
     const projection = {
       kind: issueMutationResultKind(input.kind),
       target: issueTarget ?? target,
+      ...(input.kind === "create_issue" ? { url: parseCreatedResourceUrl(result.stdout, target, "issues") } : {}),
       output: result.stdout.trim(),
     };
     return { projection, target };
@@ -495,9 +555,16 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       const approved = await ask("Confirm GitHub write", pullRequestEffect(input, target));
       if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: pullRequestEffect(input, target) }, target };
     }
-    const result = await run({ argv: buildPullRequestArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    const result = await run({ argv: buildPullRequestArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
+    const extra = await pullRequestWriteDetails(input, target, ctx, deps.executor);
     return {
-      projection: { kind: pullRequestMutationResultKind(input), target, output: result.stdout.trim() },
+      projection: {
+        kind: pullRequestMutationResultKind(input),
+        target,
+        ...extra,
+        ...(input.kind === "create_pull_request" ? { url: parseCreatedResourceUrl(result.stdout, target, "pull") } : {}),
+        output: result.stdout.trim(),
+      },
       target,
     };
   }
@@ -511,14 +578,14 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     const endpoint = normalizeApiEndpoint(input.endpoint);
     validateJq(input.jq);
     validateApiCache(input.cache);
-    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const page = clamp(input.page, 1, 1, MAX_RESULT_PAGE);
     const perPage = clamp(input.perPage, 50, 1, 50);
     await ensureGh(ctx.signal);
     await ensureHost(host, ctx.signal);
     validateApiQuery(input.query);
     const safeEndpoint = redactSecrets(endpoint);
     const safeTarget: ApiTarget = { kind: "api", host, endpoint: safeEndpoint };
-    const result = await run({ argv: buildApiGetArgv(input, host, endpoint, page, perPage), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    const result = await run({ argv: buildApiGetArgv(input, host, endpoint, page, perPage), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, `${host} ${redactSecrets(endpoint)}`);
     const outputBytes = Buffer.byteLength(result.stdout, "utf8");
     if (outputBytes > MAX_API_RESPONSE_BYTES) {
       const { path } = await tempOutput.write(result.stdout);
@@ -561,7 +628,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       const approved = await ask("Confirm GitHub write", actionReleaseEffect(input, target));
       if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: actionReleaseEffect(input, target) }, target };
     }
-    const result = await run({ argv: buildActionReleaseArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    const result = await run({ argv: buildActionReleaseArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
     return { projection: { kind: actionReleaseResultKind(input.kind), target, output: result.stdout.trim() }, target };
   }
 
@@ -635,7 +702,7 @@ function buildSearchArgv(
   const endpoint = kind === "repositories" ? "search/repositories" : kind === "code" ? "search/code" : kind === "commits" ? "search/commits" : "search/issues";
   const qualifier = kind === "issues" ? "is:issue" : kind === "pull_requests" ? "is:pr" : undefined;
   const scoped = [query, qualifier, target ? `repo:${target.owner}/${target.name}` : undefined]
-    .filter((part): part is string => Boolean(part))
+    .filter((part, index, all): part is string => Boolean(part) && all.indexOf(part) === index)
     .join(" ");
   return [
     "api",
@@ -664,7 +731,7 @@ function buildContentArgv(input: ContentRequestInput, target: ResourceTarget, li
         `repos/${repository}/contents${input.path ? `/${encodeRepositoryPath(input.path)}` : ""}`,
         "--method",
         "GET",
-        ...(input.ref ? ["--field", `ref=${input.ref}`] : []),
+        ...(input.ref ? ["--raw-field", `ref=${input.ref}`] : []),
       ];
     case "pr_files":
       return [
@@ -737,6 +804,8 @@ function compactSearchItem(raw: unknown, expanded: boolean): Record<string, unkn
 }
 
 function projectFile(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined): Record<string, unknown> {
+  /* Base64 content is fully decoded, mirroring gh_read_file: the contents
+   * endpoint always wraps text files in base64 (report issue). */
   const base = { kind: "file", target, path, ref: ref ?? null };
   if (typeof raw === "string") return { ...base, binary: false, encoding: "utf-8", byteCount: Buffer.byteLength(raw), content: raw };
   if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub file JSON was not an object.");
@@ -761,9 +830,36 @@ function projectFile(raw: unknown, target: ResourceTarget, path: string, ref: st
 }
 
 function projectDirectory(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined, limit: number): Record<string, unknown> {
-  if (!Array.isArray(raw)) throw new GhExecutionError("malformed_json", "GitHub directory JSON was not an array.");
-  const entries = raw.slice(0, limit).map((entry) => compactDirectoryEntry(entry));
-  return { kind: "directory", target, path, ref: ref ?? null, entryCount: entries.length, entries };
+  let listing: unknown[];
+  let treeShape = false;
+  if (Array.isArray(raw)) {
+    listing = raw;
+  } else if (raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).tree)) {
+    /* The Git trees endpoint returns { sha, url, tree: [...] } and ignores the
+     * ?path parameter (each entry carries its full path). Filter locally so a
+     * &#96;tree/docs&#96; view actually shows the docs directory (report issue 7). */
+    listing = (raw as Record<string, unknown>).tree as unknown[];
+    treeShape = true;
+    if (path) {
+      const prefix = path.endsWith("/") ? path : `${path}/`;
+      listing = listing.filter((entry) =>
+        entry && typeof entry === "object" && typeof (entry as Record<string, unknown>).path === "string"
+          ? ((entry as Record<string, unknown>).path as string).startsWith(prefix)
+          : false,
+      );
+    }
+  } else {
+    throw new GhExecutionError("malformed_json", "GitHub directory JSON was not an array.");
+  }
+  const entries = listing.slice(0, limit).map((entry) => compactDirectoryEntry(entry));
+  const meta: Record<string, unknown> = { kind: "directory", target, path, ref: ref ?? null, entryCount: entries.length, totalEntryCount: listing.length, entries };
+  if (treeShape) {
+    meta.pathFiltered = Boolean(path);
+    meta.note = path
+      ? "The trees endpoint ignores ?path; entries were filtered to the requested directory locally."
+      : undefined;
+  }
+  return meta;
 }
 
 function compactDirectoryEntry(raw: unknown): Record<string, unknown> {
@@ -863,26 +959,43 @@ function clamp(value: number | undefined, fallback: number, minimum: number, max
   return Math.max(minimum, Math.min(maximum, numeric));
 }
 
-function buildCiArgv(input: CiRequestInput, target: ResourceTarget, limit: number, page: number): string[] {
+interface ChecksContext {
+  source: "head-branch" | "head-commit";
+  headRefName?: string;
+  headRefOid?: string;
+  fallbackNote?: string;
+}
+
+function waitableCiArgv(input: CiRequestInput, target: ResourceTarget, limit: number, page: number): string[] {
   const repository = formatRepositoryTarget(target)!;
   const cliRepository = cliRepositoryTarget(target);
   switch (input.kind) {
-    case "list_runs":
+    case "list_runs": {
+      /* REST /actions/runs has no conclusion parameter and cannot filter by
+       * workflow, so any filtered listing uses `gh run list`, which filters
+       * server-side. */
+      if (input.workflow || input.branch || input.status || input.conclusion) {
+        return [
+          "run", "list", "--repo", cliRepository, "--limit", String(limit),
+          "--json", `${RUN_VIEW_FIELDS},workflowDatabaseId`,
+          ...(input.workflow ? ["--workflow", input.workflow] : []),
+          ...(input.branch ? ["--branch", input.branch] : []),
+          ...(input.status ? ["--status", input.status] : []),
+          ...(!input.status && input.conclusion ? ["--status", input.conclusion] : []),
+        ];
+      }
       return [
         "api",
         ...hostnameArgs(target),
         `repos/${repository}/actions/runs`,
         "--method",
         "GET",
-        ...(input.workflow ? ["--field", `workflow_id=${input.workflow}`] : []),
-        ...(input.branch ? ["--field", `branch=${input.branch}`] : []),
-        ...(input.status ? ["--field", `status=${input.status}`] : []),
-        ...(input.conclusion ? ["--field", `conclusion=${input.conclusion}`] : []),
         "--field",
         `per_page=${limit}`,
         "--field",
         `page=${page}`,
       ];
+    }
     case "view_run":
       return ["run", "view", String(targetNumberForKind(target, "workflow_run")), "--repo", cliRepository, ...(input.attempt ? ["--attempt", String(input.attempt)] : []), "--json", RUN_VIEW_FIELDS];
     case "view_job":
@@ -896,17 +1009,55 @@ function buildCiArgv(input: CiRequestInput, target: ResourceTarget, limit: numbe
   }
 }
 
-function projectCi(raw: unknown, kind: Exclude<CiKind, "failed_logs">, target: ResourceTarget, page: number, limit: number): Record<string, unknown> {
+function projectCi(
+  raw: unknown,
+  kind: Exclude<CiKind, "failed_logs">,
+  target: ResourceTarget,
+  page: number,
+  limit: number,
+  checksContext?: ChecksContext,
+): Record<string, unknown> {
   if (kind === "list_runs") {
+    if (Array.isArray(raw)) {
+      /* Filtered listings come from `gh run list`, which returns a bounded
+       * array without the REST total_count envelope. */
+      const runs = raw.slice(0, limit).map(compactWorkflowRun);
+      return { kind: "workflow_runs", target, page, limit, totalCount: null, filtered: true, runCount: runs.length, runs };
+    }
     if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub workflow-runs JSON was not an object.");
     const value = raw as Record<string, unknown>;
     const runs = Array.isArray(value.workflow_runs) ? value.workflow_runs.slice(0, limit).map(compactWorkflowRun) : [];
-    return { kind: "workflow_runs", target, page, limit, totalCount: asNumber(value.total_count), runCount: runs.length, runs };
+    return { kind: "workflow_runs", target, page, limit, totalCount: asNumber(value.total_count), filtered: false, runCount: runs.length, runs };
   }
   if (kind === "pr_checks") {
+    if (!checksContext) throw new GhExecutionError("malformed_json", "GitHub checks context was not captured.");
     if (!Array.isArray(raw)) throw new GhExecutionError("malformed_json", "GitHub checks JSON was not an array.");
-    const checks = raw.map((entry) => redactUnknown(entry));
-    return { kind: "pull_request_checks", target, checkCount: checks.length, checks };
+    const checks = raw.map((entry) => redactUnknown(entry) as Record<string, unknown>);
+    const buckets = new Map<string, number>();
+    for (const check of checks) {
+      const bucket = typeof check.bucket === "string" ? check.bucket : "other";
+      buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+    }
+    const failures = checks.filter((check) => [String(check.state), String(check.bucket)].some((value) => /failure|fail/i.test(value)));
+    const pending = checks.filter((check) => [String(check.state), String(check.bucket)].some((value) => /pending|in_progress/i.test(value)));
+    const summary = {
+      kind: "pull_request_checks",
+      target,
+      ...checksContext,
+      checkCount: checks.length,
+      failedCount: failures.length,
+      pendingCount: pending.length,
+      buckets: Object.fromEntries(buckets),
+      checks,
+    };
+    if (checks.length === 0) {
+      return {
+        ...summary,
+        empty: true,
+        note: "No checks are reported for this pull request. Its head branch may be deleted (merged/squashed PRs) or CI never ran on it.",
+      };
+    }
+    return summary;
   }
   if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub CI JSON was not an object.");
   return { kind: kind === "view_job" ? "job" : "workflow_run", target, ...redactUnknown(raw) as Record<string, unknown> };
@@ -915,7 +1066,7 @@ function projectCi(raw: unknown, kind: Exclude<CiKind, "failed_logs">, target: R
 function compactWorkflowRun(raw: unknown): Record<string, unknown> {
   if (!raw || typeof raw !== "object") return { value: raw };
   const value = raw as Record<string, unknown>;
-  const keys = ["databaseId", "id", "name", "workflowName", "displayTitle", "status", "conclusion", "event", "headBranch", "headSha", "attempt", "createdAt", "updatedAt", "url", "html_url"];
+  const keys = ["databaseId", "id", "name", "workflowName", "workflowDatabaseId", "displayTitle", "status", "conclusion", "event", "headBranch", "headSha", "attempt", "createdAt", "updatedAt", "url", "html_url"];
   return Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, redactUnknown(value[key])]));
 }
 
@@ -932,12 +1083,52 @@ function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: s
       current.lines.push(line);
     }
   }
+  const availableSteps = sections.map((section) => section.name);
+  if (sections.length === 0) {
+    if (raw.trim() === "") {
+      return {
+        kind: "failed_logs",
+        target,
+        step: null,
+        note: "The --log-failed output is empty: the run has no failed steps (it may have succeeded), or its logs have expired.",
+        log: "",
+        lineCount: 0,
+        byteCount: 0,
+        partial: false,
+      };
+    }
+    return {
+      kind: "failed_logs",
+      target,
+      step: null,
+      note: "The --log-failed output had no recognizable step sections.",
+      availableSteps,
+      rawPreview: redactSecrets(raw.slice(0, 2_000)),
+      log: "",
+      lineCount: 0,
+      byteCount: 0,
+      partial: false,
+    };
+  }
   let selected: string[];
   let step: string;
   let partial = false;
   if (requestedStep) {
     const match = sections.find((section) => section.name.toLowerCase().includes(requestedStep.toLowerCase()));
-    if (!match) return { kind: "failed_logs", target, step: "UNKNOWN STEP", log: "", lineCount: 0, byteCount: 0, partial: true };
+    if (!match) {
+      return {
+        kind: "failed_logs",
+        target,
+        step: null,
+        requestedStep,
+        note: `No failed step named "${requestedStep}" in this run.`,
+        availableSteps,
+        log: "",
+        lineCount: 0,
+        byteCount: 0,
+        partial: false,
+      };
+    }
     selected = match.lines;
     step = match.name;
   } else {
@@ -961,7 +1152,7 @@ function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: s
   }
   const log = bounded.join("\n");
   if (bounded.length < selected.length) partial = true;
-  return { kind: "failed_logs", target, step, log, lineCount: bounded.length, byteCount: Buffer.byteLength(log), partial };
+  return { kind: "failed_logs", target, step, availableSteps, log, lineCount: bounded.length, byteCount: Buffer.byteLength(log), partial };
 }
 
 function ciSummaryKeys(kind: CiKind): readonly string[] {
@@ -1102,7 +1293,7 @@ function buildPullRequestArgv(input: PullRequestRequestInput, target: ResourceTa
   const repository = cliRepositoryTarget(target);
   if (input.kind === "create_pull_request") {
     return [
-      "pr", "create", "--repo", repository, "--title", input.title ?? "", ...(input.body !== undefined ? ["--body", input.body] : []),
+      "pr", "create", "--repo", repository, "--title", input.title ?? "", "--body", input.body ?? "",
       "--head", input.head ?? "", ...(input.base ? ["--base", input.base] : []), ...(input.draft ? ["--draft"] : []),
       ...repeatFlags("--reviewer", input.reviewers), ...repeatFlags("--assignee", input.assignees), ...repeatFlags("--label", input.labels),
     ];
@@ -1115,7 +1306,14 @@ function buildPullRequestArgv(input: PullRequestRequestInput, target: ResourceTa
     ...(input.base ? ["--base", input.base] : []), ...(input.draft === true ? ["--draft"] : input.draft === false ? ["--ready"] : []),
     ...repeatFlags("--add-reviewer", input.reviewers), ...repeatFlags("--add-assignee", input.assignees), ...repeatFlags("--add-label", input.labels),
   ];
-  if (input.kind === "review_pull_request") return ["pr", "review", String(number), "--repo", repository, `--${input.event === "request_changes" ? "request-changes" : input.event ?? "comment"}`, ...(input.body !== undefined ? ["--body", input.body] : [])];
+  if (input.kind === "review_pull_request") {
+    const event = input.event === "request_changes" ? "request-changes" : input.event ?? "comment";
+    const body = input.body ?? "";
+    if (event === "comment" && body.trim() === "") {
+      throw new GhExecutionError("validation", "A comment review requires a non-empty body. Use event approve or request_changes for a body-less review.");
+    }
+    return ["pr", "review", String(number), "--repo", repository, `--${event}`, "--body", body];
+  }
   if (input.kind === "merge_pull_request") return ["pr", "merge", String(number), "--repo", repository, `--${input.method ?? "merge"}`, ...(input.deleteBranch ? ["--delete-branch"] : [])];
   if (input.kind === "close_pull_request") return ["pr", "close", String(number), "--repo", repository];
   if (input.kind === "reopen_pull_request") return ["pr", "reopen", String(number), "--repo", repository];
@@ -1142,9 +1340,12 @@ function normalizeApiEndpoint(raw: string): string {
 function validateJq(jq: string | undefined): void {
   if (jq === undefined) return;
   const expression = jq.trim();
-  const path = /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]+\]|\[\])+$/;
+  if (expression.includes("(") || expression.includes(")") || expression.includes(";") || expression.includes(",")) {
+    throw new GhExecutionError("validation", "API GET jq projections may only use field access, array access, and slice operators (`.a`, `.a[0]`, `.a[:3]`, `[]`, `.[]`).");
+  }
+  const path = /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]*:[0-9]*\]|\[[0-9]+\]|\[\])+$/;
   if (expression !== "." && (!expression || expression.split("|").some((part) => !path.test(part.trim())))) {
-    throw new GhExecutionError("validation", "API GET jq projections are limited to data paths and array indexes.");
+    throw new GhExecutionError("validation", "API GET jq projections are limited to data paths, array indexes, and slices (`.a`, `.a[0]`, `.a[:3]`, `[]`).");
   }
 }
 
@@ -1162,8 +1363,11 @@ function validateApiQuery(query: Record<string, string> | undefined): void {
     const keyBytes = Buffer.byteLength(key, "utf8");
     const valueBytes = Buffer.byteLength(value, "utf8");
     totalBytes += keyBytes + valueBytes;
-    if (keyBytes > MAX_API_QUERY_KEY_BYTES || valueBytes > MAX_API_QUERY_VALUE_BYTES || totalBytes > MAX_API_QUERY_BYTES || !/^[A-Za-z][A-Za-z0-9_]*$/.test(key) || key === "page" || key === "per_page" || key.includes("@") || key.includes("\u0000") || value.includes("@") || value.includes("\u0000")) {
+    if (keyBytes > MAX_API_QUERY_KEY_BYTES || valueBytes > MAX_API_QUERY_VALUE_BYTES || totalBytes > MAX_API_QUERY_BYTES || !/^[A-Za-z][A-Za-z0-9_]*$/.test(key) || key === "page" || key === "per_page" || key.includes("@") || key.includes("\u0000") || value.includes("\u0000")) {
       throw new GhExecutionError("validation", "API GET query parameters exceed safety limits or contain forbidden syntax.");
+    }
+    if (value.includes("@")) {
+      throw new GhExecutionError("validation", `Query value for "${key}" must not contain "@" (credential-leak guard). Strip emails or use a search qualifier instead.`);
     }
   }
 }
@@ -1235,6 +1439,265 @@ function validateAssetPath(path: string): void {
   }
 }
 
+/** Describes any non-checkout target so entity errors carry context. */
+export function describeTarget(target: ResourceTarget): string {
+  if (target.kind === "current_checkout") return "current checkout";
+  const repository = formatRepositoryTarget(target);
+  if (target.kind === "repository") return repository ?? "repository";
+  switch (target.kind) {
+    case "issue":
+    case "pull_request": {
+      const kindName = target.kind === "pull_request" ? "pull request" : "issue";
+      return `${repository} ${kindName} #${target.number}`;
+    }
+    case "commit":
+      return `${repository} commit ${target.sha.slice(0, 7)}`;
+    case "release":
+      return `${repository} release ${target.tag}`;
+    case "workflow_run":
+      return `${repository} workflow run ${target.runId}`;
+    case "job":
+      return `${repository} job ${target.jobId} (run ${target.runId})`;
+    case "file":
+      return `${repository} file ${target.path}@${target.ref}`;
+    case "tree":
+      return `${repository} tree ${target.path ?? "/"}@${target.ref}`;
+    case "compare":
+      return `${repository} compare ${target.base}...${target.head}`;
+    default:
+      return assertNever(target);
+  }
+}
+
+function viewFallbackHint(target: ResourceTarget): string | undefined {
+  if (target.kind === "file") return `Try gh_read_file with ref=${target.ref} or check the path.`;
+  if (target.kind === "workflow_run") return "Check the run id; older runs and deleted runs return 404.";
+  if (target.kind === "job") return "Check the run id and job id; reconstructed logs expire after 400 days.";
+  return undefined;
+}
+
+/** Fields newer gh versions expose that 2.81.0 lacks. */
+function viewExtras(kind: ViewResourceKind): string[] {
+  switch (kind) {
+    case "release":
+      return RELEASE_VIEW_FIELDS_EXTRA;
+    case "workflow_run":
+      return RUN_VIEW_FIELDS_EXTRA;
+    case "job":
+      return JOB_VIEW_FIELDS_EXTRA;
+    default:
+      return [];
+  }
+}
+
+function failedLogsHint(input: CiRequestInput, target: ResourceTarget): string | undefined {
+  if (input.kind !== "failed_logs") return undefined;
+  return "No sections in --log-failed output usually means the run had no failing steps, or the logs have expired.";
+}
+
+function readFileNotFoundHint(input: ContentRequestInput, target: ResourceTarget): string | undefined {
+  if (input.kind !== "read_file") return undefined;
+  return "The contents endpoint defaults to the repository default branch; pass `ref` if the file lives on a different branch.";
+}
+
+function ciRunHint(input: CiRequestInput, target: ResourceTarget): string | undefined {
+  if (input.kind === "pr_checks") {
+    return "This tool checks the PR's head branch by default; if no checks are reported, re-check the PR ref (gh_view) or verify the head commit.";
+  }
+  return undefined;
+}
+
+function jsonFieldList(argv: string[]): string[] {
+  const index = argv.indexOf("--json");
+  if (index === -1) return [];
+  return (argv[index + 1] ?? "").split(",").map((field) => field.trim()).filter(Boolean);
+}
+
+function parseUnknownJsonField(stderr: string): string | undefined {
+  const match = /Unknown JSON field: "([^"]+)"/i.exec(stderr);
+  return match?.[1];
+}
+
+/** Parses the URL a created issue/PR prints ("https://github.com/owner/repo/issues/123"). */
+function parseCreatedResourceUrl(stdout: string, target: ResourceTarget, kind: "issues" | "pull"): string | undefined {
+  const host = target.kind === "current_checkout" ? undefined : target.host;
+  const repository = formatRepositoryTarget(target);
+  if (!repository) return undefined;
+  const hostPattern = host && !isGithubHost(host) ? `(?:https?://)?${escapeRegex(host)}/` : "https://github.com/";
+  const match = new RegExp(`${hostPattern}${escapeRegex(repository)}/${kind}/(\\d+)`).exec(stdout.trim());
+  return match?.[0];
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Resolves a PR via GraphQL (owner/repo#number) so deleted head branches degrade gracefully. */
+async function resolveNumberedPullRequest(
+  target: Extract<ResourceTarget, { kind: "pull_request" }>,
+  signal: AbortSignal | undefined,
+  execute: GhExecutor,
+): Promise<ResolvedPullRequest | undefined> {
+  const query = `query { repository(owner: ${JSON.stringify(target.owner)}, name: ${JSON.stringify(target.name)}) { pullRequest(number: ${target.number}) { number headRefName headRefOid state } } }`;
+  const request: GhExecRequest = {
+    argv: ["api", "graphql", ...hostnameArgs(target), "--field", `query=${query}`],
+    signal,
+    timeout: DEFAULT_TIMEOUT_MS,
+  };
+  const raw = await execute(request);
+  const result = { ...raw, stdout: boundedDiagnostics(raw).stdout, stderr: boundedDiagnostics(raw).stderr };
+  const category = classifyGhFailure(result, signal);
+  if (category) {
+    throw new GhExecutionError(category, describeFailureWithContext(category, result, describeTarget(target), "No checks on the head branch (deleted after merge?); resolving the head commit."));
+  }
+  if (result.code !== 0) {
+    throw new GhExecutionError("unsupported", describeFailureWithContext("unsupported", result, describeTarget(target), "No checks on the head branch (deleted after merge?); resolving the head commit."));
+  }
+  try {
+    const decoded = JSON.parse(result.stdout) as {
+      data?: { repository?: { pullRequest?: { number?: number; headRefName?: string | null; headRefOid?: string; state?: string } | null } };
+    };
+    const entry = decoded.data?.repository?.pullRequest;
+    if (!entry || entry.number === undefined) return undefined;
+    return {
+      kind: "PullRequest",
+      number: entry.number,
+      headRefName: entry.headRefName ?? null,
+      headRefOid: entry.headRefOid,
+      state: entry.state,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Additional verified state echoed after a pull-request write. */
+async function pullRequestWriteDetails(
+  input: PullRequestRequestInput,
+  target: ResourceTarget,
+  ctx: { cwd: string; signal?: AbortSignal },
+  execute: GhExecutor,
+): Promise<Record<string, unknown>> {
+  const requested = { method: input.method ?? "merge", deleteBranch: Boolean(input.deleteBranch), event: input.event ?? null } as Record<string, unknown>;
+  if (target.kind !== "pull_request") {
+    return input.kind === "create_pull_request"
+      ? { requested: { ...requested, head: input.head ?? null, base: input.base ?? null, draft: Boolean(input.draft) } }
+      : {};
+  }
+  const base: Record<string, unknown> = { requested };
+  if (input.kind === "merge_pull_request") {
+    try {
+      const resolved = await resolveNumberedPullRequest(target, ctx.signal, execute);
+      if (resolved?.state === "MERGED") {
+        const prResult = await execute({
+          argv: ["pr", "view", String(target.number), "--repo", cliRepositoryTarget(target), "--json", "state,mergedAt,mergeCommit"],
+          cwd: ctx.cwd,
+          signal: ctx.signal,
+          timeout: DEFAULT_TIMEOUT_MS,
+        });
+        if (prResult.code === 0) {
+          const decoded = JSON.parse(prResult.stdout) as { state?: unknown; mergedAt?: unknown; mergeCommit?: unknown };
+          base.merged = { state: decoded.state ?? null, mergedAt: decoded.mergedAt ?? null, mergeCommit: decoded.mergeCommit ?? null };
+        } else {
+          base.merged = null;
+        }
+      } else {
+        base.merged = null;
+      }
+    } catch {
+      base.merged = null;
+    }
+  }
+  return base;
+}
+
+/** Runs CI reads with pr_checks fallback to the head commit's check-runs. */
+async function runChecks(
+  input: CiRequestInput,
+  target: ResourceTarget,
+  limit: number,
+  page: number,
+  ctx: { cwd: string; signal?: AbortSignal },
+  lower: (argv: string[]) => Promise<GhExecResult>,
+  execute: GhExecutor,
+): Promise<{ result: GhExecResult; checksContext?: ChecksContext }> {
+  const executing = async (argv: string[]) => lower(argv);
+  if (input.kind === "pr_checks" && target.kind === "pull_request") {
+    /* First attempt runs outside the error classifier so the "no checks"
+     * signal can drive the head-commit fallback instead of throwing. */
+    const argv = waitableCiArgv(input, target, limit, page);
+    const rawFirst = await execute({ argv, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    const first = {
+      ...rawFirst,
+      stdout: boundedDiagnostics(rawFirst).stdout,
+      stderr: boundedDiagnostics(rawFirst).stderr,
+    };
+    const noChecks = /no checks reported/i.test(first.stderr) || (first.code !== 0 && first.stdout === "");
+    if (!noChecks) {
+      const category = classifyGhFailure(first, ctx.signal);
+      if (category || first.code !== 0) {
+        throw new GhExecutionError(
+          category ?? "unsupported",
+          describeFailureWithContext(category ?? "unsupported", first, describeTarget(target), ciRunHint(input, target)),
+        );
+      }
+    }
+    if (noChecks) {
+      let resolved: ResolvedPullRequest | undefined;
+      try {
+        resolved = await resolveNumberedPullRequest(target, ctx.signal, execute);
+      } catch {
+        resolved = undefined;
+      }
+      if (resolved?.headRefOid) {
+        const fallbackArgv = [
+          "api",
+          ...hostnameArgs(target),
+          `repos/${formatRepositoryTarget(target)!}/commits/${encodeURIComponent(resolved.headRefOid)}/check-runs`,
+          "--method",
+          "GET",
+          "--field",
+          `per_page=${limit}`,
+        ];
+        const fallback = await executing(fallbackArgv);
+        const decoded = decodeJson(fallback);
+        if (decoded && typeof decoded === "object") {
+          const runs = (decoded as { check_runs?: unknown[] }).check_runs;
+          if (Array.isArray(runs)) {
+            const normalized = runs.map((run) =>
+              run && typeof run === "object"
+                ? {
+                    name: (run as Record<string, unknown>).name,
+                    state: String((run as Record<string, unknown>).conclusion ?? (run as Record<string, unknown>).status ?? "UNKNOWN").toUpperCase(),
+                    bucket: (run as Record<string, unknown>).conclusion ?? null,
+                    link: (run as Record<string, unknown>).html_url ?? (run as Record<string, unknown>).details_url ?? null,
+                    workflow: (run as Record<string, unknown>).app && typeof (run as Record<string, unknown>).app === "object"
+                      ? ((run as Record<string, unknown>).app as Record<string, unknown>).name ?? null
+                      : null,
+                  }
+                : null,
+            ).filter((run) => Boolean(run));
+            return {
+              result: { ...fallback, stdout: JSON.stringify(normalized) },
+              checksContext: {
+                source: "head-commit",
+                headRefName: resolved.headRefName ?? undefined,
+                headRefOid: resolved.headRefOid,
+                fallbackNote: "No checks on the head branch (deleted after merge?); these are the head commit's check-runs.",
+              },
+            };
+          }
+        }
+      }
+    }
+    return { result: first, checksContext: { source: "head-branch" } };
+  }
+  if (input.kind === "list_runs") {
+    return { result: await executing(waitableCiArgv(input, target, limit, page)) };
+  }
+  return { result: await executing(waitableCiArgv(input, target, limit, page)) };
+}
+
 export function projectRepository(raw: unknown): Record<string, unknown> {
   if (!raw || typeof raw !== "object") {
     throw new GhExecutionError("malformed_json", "gh repository JSON was not an object.");
@@ -1266,10 +1729,35 @@ export function projectRepository(raw: unknown): Record<string, unknown> {
 export function projectResource(raw: unknown, target: ResourceTarget): Record<string, unknown> {
   if (target.kind === "repository" || target.kind === "current_checkout") return projectRepository(raw);
   const targetProjection = { ...target };
+  if (target.kind === "tree") {
+    const filtered = filterTreeToPath(raw, target.path);
+    return {
+      kind: target.kind,
+      target: targetProjection,
+      ...(target.path ? { note: "The trees endpoint ignores ?path; entries below were filtered locally." } : {}),
+      data: redactUnknown(filtered),
+    };
+  }
   return {
     kind: target.kind,
     target: targetProjection,
     data: redactUnknown(raw),
+  };
+}
+
+/** Filters a Git-trees response ({ tree: [...] }) to a directory prefix. */
+function filterTreeToPath(raw: unknown, path: string | undefined): unknown {
+  if (!path || !raw || typeof raw !== "object") return raw;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.tree)) return raw;
+  const prefix = path.endsWith("/") ? path : `${path}/`;
+  return {
+    ...value,
+    tree: value.tree.filter((entry) =>
+      entry && typeof entry === "object" && typeof (entry as Record<string, unknown>).path === "string"
+        ? ((entry as Record<string, unknown>).path as string).startsWith(prefix)
+        : false,
+    ),
   };
 }
 

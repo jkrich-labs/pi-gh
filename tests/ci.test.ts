@@ -21,25 +21,47 @@ function load(name: string, response: unknown) {
 
 test("CI tools list workflow runs with repository qualification, filters, and bounds", async () => {
   const runs = [{ databaseId: 100, workflowName: "build", status: "completed", conclusion: "success" }];
-  const { executor, tool } = load("gh_list_workflow_runs", { total_count: 1, workflow_runs: runs });
+  const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+    ? version()
+    : request.argv[0] === "run"
+      ? json(runs)
+      : json({ total_count: 1, workflow_runs: runs }));
+  const loaded = loadExtension({ executor: executor.execute });
+  const tool = loaded.tools.get("gh_list_workflow_runs");
+  assert.ok(tool, "gh_list_workflow_runs must be registered");
   const result = await tool.execute(
     "ci-list",
-    { repo: "cli/cli", workflow: "build.yml", branch: "main", limit: 4, page: 2 },
+    { repo: "cli/cli", workflow: "build", branch: "main", limit: 4 },
     undefined,
     undefined,
     toolCtx() as never,
   );
-  const projection = projectionOf(result) as { runs: unknown[]; page: number; limit: number };
+  const projection = projectionOf(result) as { runs: unknown[]; filtered: boolean; limit: number };
+  assert.equal(projection.filtered, true);
   assert.deepEqual(projection.runs, runs);
-  assert.equal(projection.page, 2);
   assert.equal(projection.limit, 4);
-  const request = executor.calls.find((call) => call.argv[0] === "api");
+  const request = executor.calls.find((call) => call.argv[0] === "run");
   assert.ok(request);
-  assert.ok(request.argv.includes("repos/cli/cli/actions/runs"));
-  assert.ok(request.argv.includes("workflow_id=build.yml"));
-  assert.ok(request.argv.includes("branch=main"));
-  assert.ok(request.argv.includes("per_page=4"));
-  assert.ok(request.argv.includes("page=2"));
+  assert.ok(request.argv.includes("list") && request.argv.includes("--repo") && request.argv.includes("cli/cli"));
+  assert.ok(request.argv.includes("--limit") && request.argv.includes(String(4)));
+  assert.ok(request.argv.includes("--workflow") && request.argv.includes("build"));
+  assert.ok(request.argv.includes("--branch") && request.argv.includes("main"));
+
+  // No filters → REST endpoint used.
+  const plain = await tool.execute(
+    "ci-list-plain",
+    { repo: "cli/cli", limit: 3 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const plainProjection = projectionOf(plain) as { runs: unknown[]; filtered: boolean };
+  assert.equal(plainProjection.filtered, false);
+  assert.deepEqual(plainProjection.runs, runs);
+  const apiCall = executor.calls.find((call) => call.argv[0] === "api");
+  assert.ok(apiCall);
+  assert.ok(apiCall.argv.includes("repos/cli/cli/actions/runs"));
+  assert.ok(apiCall.argv.includes("per_page=3"));
 });
 
 test("CI tools view workflow attempts, jobs, and pull-request checks", async () => {

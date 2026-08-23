@@ -41,23 +41,29 @@ export function isMissingCli(error: unknown): boolean {
   return code === "ENOENT" || /ENOENT|not found|cannot find/i.test(message);
 }
 
+/** Error-message context applied before stderr takes over (see describeFailureWithContext). */
 export function classifyGhFailure(
   result: { stdout: string; stderr: string; code: number; killed: boolean },
   signal?: AbortSignal,
 ): ErrorCategory | undefined {
   if (signal?.aborted) return "aborted";
   if (result.killed) return "timeout";
+  // Exit 0 means gh succeeded; treating a successful response body as a failure
+  // produced the impossible "failed with exit 0" error (report issue).
+  if (result.code === 0) return undefined;
   const text = `${result.stderr}\n${result.stdout}`;
   if (result.code === 4 || /auth login|authentication required|not logged in|not authenticated|login required|bad credentials|HTTP 401/i.test(text)) {
     return "auth";
   }
-  if (/could not resolve to a repository|HTTP 404|\bnot found\b/i.test(text)) return "not_found";
+  // Matches both REST refs ("Could not resolve to a repository") and GraphQL
+  // refs ("Could not resolve to an issue or a pull request").
+  if (/could not resolve to an?|HTTP 404|\bnot found\b/i.test(text)) return "not_found";
+  if (/no checks reported/i.test(text)) return "not_found";
   if (/resource not accessible|permission denied|HTTP 403|forbidden/i.test(text)) return "permission";
   if (/rate limit|HTTP 429/i.test(text)) return "rate_limit";
   if (/already exists|HTTP 409|conflict/i.test(text)) return "conflict";
   if (/not mergeable|mergeability/i.test(text)) return "not_mergeable";
   if (/required (?:status )?checks|checks have not passed|status checks have not passed/i.test(text)) return "required_checks";
-  if (result.code !== 0) return undefined;
   return undefined;
 }
 
@@ -86,6 +92,18 @@ export function describeFailure(
     default:
       return stderr || `GitHub CLI failed with exit ${result.code}.`;
   }
+}
+
+/** Like describeFailure, but prepends the target description so failures name the resource they hit. */
+export function describeFailureWithContext(
+  category: ErrorCategory,
+  result: { stdout: string; stderr: string; code: number },
+  targetDescription: string,
+  hint?: string,
+): string {
+  const base = describeFailure(category, result);
+  const prefix = `[${redactSecrets(targetDescription)}]`;
+  return hint && base !== hint ? `${prefix} ${base} ${hint}` : `${prefix} ${base}`;
 }
 
 function redactValue(value: unknown): unknown {

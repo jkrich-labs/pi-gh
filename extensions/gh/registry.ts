@@ -93,7 +93,11 @@ export const readFileParameters = Type.Object(
   {
     repo: Type.String({ description: "Repository URL or owner/repo" }),
     path: Type.String({ description: "Repository-relative file path" }),
-    ref: Type.Optional(Type.String({ description: "Branch, tag, or commit ref" })),
+    ref: Type.Optional(
+      Type.String({
+        description: "Branch, tag, or commit ref. Defaults to the repository default branch; pass this when the file lives elsewhere, or a 404 may result.",
+      }),
+    ),
     detail: Type.Optional(detailParameter()),
   },
   { additionalProperties: false },
@@ -113,7 +117,7 @@ export const listDirectoryParameters = Type.Object(
 export const pullRequestFilesParameters = Type.Object(
   {
     target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
-    limit: Type.Optional(Type.Integer({ description: "Maximum changed files", minimum: 1, maximum: 50, default: 30 })),
+    limit: Type.Optional(Type.Integer({ description: "Maximum changed files", minimum: 1, maximum: 50, default: 10 })),
     page: Type.Optional(Type.Integer({ description: "Result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
     detail: Type.Optional(detailParameter()),
   },
@@ -128,14 +132,43 @@ export const pullRequestDiffParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const workflowRunStatusValues = [
+  "queued",
+  "in_progress",
+  "completed",
+  "requested",
+  "waiting",
+  "pending",
+  "action_required",
+] as const;
+
+export const workflowRunConclusionValues = [
+  "success",
+  "failure",
+  "cancelled",
+  "neutral",
+  "skipped",
+  "stale",
+  "startup_failure",
+  "timed_out",
+] as const;
+
 export const listWorkflowRunsParameters = Type.Object(
   {
     repo: Type.String({ description: "Repository URL or owner/repo" }),
-    workflow: Type.Optional(Type.String({ description: "Workflow name or identifier" })),
+    workflow: Type.Optional(Type.String({ description: "Workflow name, identifier, or file" })),
     branch: Type.Optional(Type.String({ description: "Branch filter" })),
-    status: Type.Optional(Type.String({ description: "Run status filter" })),
-    conclusion: Type.Optional(Type.String({ description: "Run conclusion filter" })),
-    limit: Type.Optional(Type.Integer({ description: "Maximum runs", minimum: 1, maximum: 50, default: 20 })),
+    status: Type.Optional(
+      StringEnum(workflowRunStatusValues, {
+        description: "Run status filter (gh run list --status values; a conclusion also works and is mapped for you)",
+      }),
+    ),
+    conclusion: Type.Optional(
+      StringEnum(workflowRunConclusionValues, {
+        description: "Run conclusion filter (success, failure, cancelled...)",
+      }),
+    ),
+    limit: Type.Optional(Type.Integer({ description: "Maximum runs", minimum: 1, maximum: 50, default: 10 })),
     page: Type.Optional(Type.Integer({ description: "Result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
     detail: Type.Optional(detailParameter()),
   },
@@ -803,8 +836,13 @@ function tokenize(value: string): string[] {
 
 function scoreOperation(operation: Operation, terms: string[]): number {
   if (operation.name === "gh_api_get") {
+    const explicitApiInterest = terms.some((term) => ["api", "rest", "endpoint", "raw", "escape"].includes(term));
+    const getStyle = terms.includes("get");
     const focusedResource = new Set(["issue", "issues", "pull", "pulls", "pr", "pull_request", "repository", "repositories", "repo", "release", "run", "runs", "workflow_run", "job", "jobs", "file", "files", "tree", "directory", "directories", "commit", "commits", "compare", "workflow", "workflows", "checks", "check", "logs", "log", "ci", "diff", "content", "search"]);
-    if (terms.some((term) => focusedResource.has(term))) return 0;
+    /* The API escape hatch surfaces for "api get ..." queries, and yields to the
+     * focused tools when a concrete resource dominates the query (issue 12). */
+    const apiLedGet = explicitApiInterest && getStyle;
+    if (!apiLedGet && terms.some((term) => focusedResource.has(term))) return 0;
   }
   const name = operation.name.toLowerCase();
   const aliases = operation.aliases.map((value) => value.toLowerCase());
@@ -812,8 +850,26 @@ function scoreOperation(operation: Operation, terms: string[]): number {
   const resource = operation.resourceKind.toLowerCase();
   const verb = operation.verb.toLowerCase();
   const description = `${operation.label} ${operation.description}`.toLowerCase();
+
+  // Alias-phrase matches still win: they are the human signal for the operation.
   let score = aliases.some((alias) => alias.replace(/[^a-z0-9]+/g, " ").trim() === terms.join(" ")) ? 300 : 0;
-  if (operation.name === "gh_view" && terms.some((term) => ["issue", "issues", "pull", "pr", "pull_request", "repository", "repo", "release", "run", "workflow_run", "job", "file", "tree", "commit", "compare"].includes(term))) score += 100;
+
+  // gh_view as a generic fallback should never outrank a real operation for a
+  // specific action word (comment, close, merge...). Drop its bonus when any
+  // verb-style term exists.
+  if (operation.name === "gh_view" && terms.some((term) => ["issue", "issues", "pull", "pr", "pull_request", "repository", "repo", "release", "run", "workflow_run", "job", "file", "tree", "commit", "compare"].includes(term))) {
+    score += 100;
+  }
+  if (operation.name === "gh_view" && terms.some((term) => ["comment", "close", "reopen", "merge", "review", "edit", "approve", "checks", "logs", "list", "search", "create", "files", "diff", "update", "branch", "release", "dispatch"].includes(term))) {
+    score -= 30; // strong operations should surface above the generic viewer, report issue 12
+  }
+  /* Asset-publishing verbs shouldn't surface on pure read queries (issue 12). */
+  if (
+    ["gh_upload_release_asset", "gh_delete_release", "gh_delete_release_asset"].includes(operation.name)
+    && terms.some((term) => ["read", "list", "view", "inspect"].includes(term))
+  ) {
+    score -= 80;
+  }
 
   for (const term of terms) {
     if (name === term || name.replace(/^gh_/, "") === term) score += 100;

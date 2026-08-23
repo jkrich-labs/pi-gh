@@ -103,12 +103,16 @@ test("gh_find loads exact pull request write tools", async () => {
   }
 });
 
-test("gh_find loads the uncommon REST API read tool", async () => {
+test("gh_find loads the REST API escape hatch and yields to focused tools", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");
   assert.ok(tool);
   const projection = projectionOf(await tool.execute("api read", { query: "REST API read", limit: 1 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
   assert.equal(projection.matches[0]?.name, "gh_api_get");
+  assert.equal(loaded.activeTools.includes("gh_api_get"), true);
+  /* "api get pulls list" must surface the escape hatch, not drown it (#12). */
+  const escape = projectionOf(await tool.execute("api-escape", { query: "api get pulls list", limit: 3 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+  assert.equal(escape.matches.some((match) => match.name === "gh_api_get"), true);
   assert.equal(loaded.activeTools.includes("gh_api_get"), true);
   for (const [query, expected] of [
     ["get and read issue", "gh_view"],

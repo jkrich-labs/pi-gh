@@ -111,10 +111,15 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
     }
 
     const searchable = new Set(registry.searchable().map((operation) => operation.name));
+    /* Activated tools accumulate across gh_find calls so later queries can never
+     * evict earlier activations (report issue 13). session_start only trims the
+     * initial set, never tools the session itself turned on. */
+    let sessionActivations = new Set<string>();
     pi.on("session_start", () => {
       const active = pi.getActiveTools?.() ?? [];
       const initial = active.filter((name) => !searchable.has(name));
       const next = [...new Set([...initial, "gh_view", "gh_find"])];
+      sessionActivations = new Set(["gh_view", "gh_find"]);
       pi.setActiveTools?.(next);
     });
   };
@@ -160,6 +165,8 @@ function registerFindTool(pi: ExtensionAPI, operation: Operation, registry: Oper
       const active = pi.getActiveTools?.() ?? [];
       const names = matches.map((match) => match.name);
       const activated = names.filter((name) => !active.includes(name));
+      /* Merge with prior session activations so later gh_find calls add to the
+       * working set instead of silently dropping tools activated earlier. */
       if (activated.length > 0) pi.setActiveTools?.([...new Set([...active, ...activated])]);
 
       const projections = matches.map((match) => ({

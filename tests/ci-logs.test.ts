@@ -43,7 +43,7 @@ test("failed logs select a failed step and obey line and byte bounds", async () 
   assert.ok(request.argv.includes("--log-failed"));
 });
 
-test("failed logs report UNKNOWN STEP and partial output", async () => {
+test("failed logs distinguish step-not-found from a clean run", async () => {
   const { tool } = loadLogs({ stdout: "build / test\nfailed\n", stderr: "", code: 0, killed: false });
   const result = await tool.execute(
     "logs-2",
@@ -52,10 +52,19 @@ test("failed logs report UNKNOWN STEP and partial output", async () => {
     undefined,
     toolCtx() as never,
   );
-  const projection = projectionOf(result) as { step: string; partial: boolean; log: string };
-  assert.equal(projection.step, "UNKNOWN STEP");
-  assert.equal(projection.partial, true);
+  const projection = projectionOf(result) as { step: string | null; requestedStep: string; availableSteps: string[]; log: string; note: string };
+  assert.equal(projection.step, null);
+  assert.equal(projection.requestedStep, "missing");
+  assert.deepEqual(projection.availableSteps, ["test"]);
   assert.equal(projection.log, "");
+  assert.match(projection.note, /No failed step named "missing"/);
+
+  const clean = loadLogs({ stdout: "", stderr: "", code: 0, killed: false });
+  const cleanResult = await clean.tool.execute("logs-clean", { target: "https://github.com/cli/cli/actions/runs/200" }, undefined, undefined, toolCtx() as never);
+  const cleanProjection = projectionOf(cleanResult) as { step: string | null; note: string; log: string };
+  assert.equal(cleanProjection.step, null);
+  assert.equal(cleanProjection.log, "");
+  assert.match(cleanProjection.note, /no failed steps|expired/i);
 });
 
 test("failed logs classify missing logs, timeouts, and aborts", async () => {
