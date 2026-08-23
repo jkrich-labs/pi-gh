@@ -106,9 +106,58 @@ test("the model-facing gh_view accepts every supported URL resource kind", async
   }
 });
 
-test("gh_view rejects unsupported and mismatched targets", () => {
+test("gh_view rejects unsupported hosts, explicit empty targets, and mismatched targets", () => {
   assert.throws(() => resolveResourceTarget("https://github.com/cli"), /Unsupported GitHub URL path/);
   assert.throws(() => resolveResourceTarget("https://github.com/cli/cli/issues/1", { kind: "pull_request" }), /does not match/);
   assert.throws(() => resolveResourceTarget("https://github.com/cli/cli/unknown/1"), /Unsupported GitHub URL path/);
+  for (const raw of ["", "  "]) {
+    assert.throws(
+      () => resolveResourceTarget(raw),
+      (error: unknown) => error instanceof GhExecutionError && error.category === "validation" && /resource target must not be empty/i.test(error.message),
+    );
+  }
+  for (const raw of [
+    "https://raw.githubusercontent.com/cli/cli/trunk/README.md",
+    "https://api.github.com/repos/cli/cli",
+    "https://gitlab.com/cli/cli",
+  ]) {
+    assert.throws(
+      () => resolveResourceTarget(raw),
+      (error: unknown) => error instanceof GhExecutionError && error.category === "validation" && /unsupported github host/i.test(error.message),
+    );
+  }
   assert.deepEqual(resolveResourceTarget(undefined), { kind: "current_checkout" });
+});
+
+test("gh_view reports malformed GHES authentication output with host context", async () => {
+  const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+    ? defaultVersionResult()
+    : { stdout: "{", stderr: "", code: 0, killed: false });
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_view");
+  assert.ok(tool);
+  await assert.rejects(
+    () => tool.execute("view-auth-malformed", { target: "https://ghe/team/project" }, undefined, undefined, { cwd: "/tmp", hasUI: true } as never),
+    (error: unknown) => error instanceof GhExecutionError
+      && error.category === "malformed_json"
+      && /checking authentication.*ghe/i.test(error.message),
+  );
+});
+
+test("gh_view malformed and empty output identify the requested resource", async () => {
+  for (const [id, stdout, pattern] of [
+    ["view-empty", "", /empty response.*viewing.*cli\/cli issue #42/i],
+    ["view-malformed", "{", /malformed JSON.*viewing.*cli\/cli issue #42/i],
+  ] as const) {
+    const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+      ? defaultVersionResult()
+      : { stdout, stderr: "", code: 0, killed: false });
+    const { tools } = loadExtension({ executor: executor.execute });
+    const tool = tools.get("gh_view");
+    assert.ok(tool);
+    await assert.rejects(
+      () => tool.execute(id, { target: "https://github.com/cli/cli/issues/42" }, undefined, undefined, { cwd: "/tmp", hasUI: true } as never),
+      (error: unknown) => error instanceof GhExecutionError && error.category === "malformed_json" && pattern.test(error.message),
+    );
+  }
 });

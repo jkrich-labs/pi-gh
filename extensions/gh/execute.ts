@@ -4,9 +4,10 @@ import { randomBytes } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyGhFailure, describeFailure, describeFailureWithContext, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
+import { classifyGhFailure, describeFailure, describeFailureWithContext, GhExecutionError, isMissingCli, isSensitiveKey, redactRawSecrets, redactSecrets } from "./errors.ts";
 import type { ActionReleaseKind, ApiKind, CiKind, FocusedReadKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
+  assertSupportedGithubHost,
   formatHost,
   formatRepositoryTarget,
   isGithubHost,
@@ -182,8 +183,12 @@ export interface TempOutput {
   write(content: string): Promise<{ path: string }>;
 }
 
+export function redactModelOutput<T>(value: T): T {
+  return redactUnknown(value) as T;
+}
+
 export function redactResourceTarget(target: ResourceTarget): ResourceTarget {
-  return redactUnknown(target) as ResourceTarget;
+  return redactModelOutput(target);
 }
 
 export interface GhDependencies {
@@ -211,22 +216,22 @@ function formatTempOutput(content: string): string {
     // text replacement to the serialized form can consume JSON delimiters.
     return `${JSON.stringify(redactSpillJson(JSON.parse(content)), null, 2)}\n`;
   } catch {
-    return redactSecrets(content);
+    return redactRawSecrets(content);
   }
 }
 
 function redactSpillJson(value: unknown): unknown {
-  if (typeof value === "string") return redactSecrets(value);
+  if (typeof value === "string") return redactRawSecrets(value);
   if (Array.isArray(value)) return value.map(redactSpillJson);
   if (value && typeof value === "object") {
     const redacted: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(value)) {
-      const baseKey = redactSecrets(key);
+      const baseKey = redactRawSecrets(key);
       let outputKey = baseKey;
       for (let suffix = 2; Object.hasOwn(redacted, outputKey); suffix += 1) {
         outputKey = `${baseKey}#${suffix}`;
       }
-      redacted[outputKey] = redactSpillJson(nested);
+      redacted[outputKey] = isSensitiveKey(key) ? "[redacted]" : redactSpillJson(nested);
     }
     return redacted;
   }
@@ -249,18 +254,25 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
   let ready = false;
   let hostsLoaded = false;
 
-  async function ensureGh(signal?: AbortSignal): Promise<void> {
-    if (ready) return;
-    throwIfAborted(signal);
-    let result: GhExecResult;
+  async function executeSafely(request: GhExecRequest): Promise<GhExecResult> {
     try {
-      result = await deps.executor({ argv: ["--version"], signal, timeout: 10_000 });
+      return await deps.executor(request);
     } catch (error) {
       if (isMissingCli(error)) {
         throw new GhExecutionError("missing_cli", describeFailure("missing_cli", emptyResult()));
       }
-      throw error;
+      if (request.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new GhExecutionError("aborted", describeFailure("aborted", emptyResult()));
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new GhExecutionError("unsupported", `GitHub CLI execution failed: ${message}`, { cause: message });
     }
+  }
+
+  async function ensureGh(signal?: AbortSignal): Promise<void> {
+    if (ready) return;
+    throwIfAborted(signal);
+    const result = await executeSafely({ argv: ["--version"], signal, timeout: 10_000 });
     const classified = classifyGhFailure(result, signal);
     if (classified === "timeout" || classified === "aborted") {
       throw new GhExecutionError(classified, describeFailure(classified, result));
@@ -279,16 +291,11 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
   }
 
   async function ensureHost(host: string, signal?: AbortSignal): Promise<void> {
-    const normalized = normalizeHost(host);
+    const normalized = assertSupportedGithubHost(host);
     if (authenticatedHosts.has(normalized)) return;
     if (!hostsLoaded) {
       const result = await run({ argv: ["auth", "status", "--json", "hosts"], signal, timeout: 10_000 });
-      let decoded: unknown;
-      try {
-        decoded = JSON.parse(result.stdout);
-      } catch {
-        throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
-      }
+      const decoded = decodeJsonWithContext(result, "checking authentication for", normalized);
       for (const host of extractAuthenticatedHosts(decoded)) authenticatedHosts.add(host);
       hostsLoaded = true;
     }
@@ -302,15 +309,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
 
   async function run(request: GhExecRequest, targetDescription?: string, hint?: string): Promise<GhExecResult> {
     throwIfAborted(request.signal);
-    let result: GhExecResult;
-    try {
-      result = await deps.executor(request);
-    } catch (error) {
-      if (isMissingCli(error)) {
-        throw new GhExecutionError("missing_cli", describeFailure("missing_cli", emptyResult()));
-      }
-      throw error;
-    }
+    const result = await executeSafely(request);
     if (request.maxOutputBytes !== undefined && Buffer.byteLength(result.stdout, "utf8") > request.maxOutputBytes) {
       throw new GhExecutionError("validation", "GitHub CLI output exceeded the bounded response limit.", {
         byteCount: Buffer.byteLength(result.stdout, "utf8"),
@@ -392,16 +391,18 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     if (target.kind === "job" || target.kind === "workflow_run") {
       decoded = decodeCiJson(result, target.kind === "job" ? "view_job" : "view_run", target);
     } else {
-      try {
-        decoded = JSON.parse(result.stdout);
-      } catch {
-        throw new GhExecutionError("malformed_json", describeFailure("malformed_json", result));
-      }
+      decoded = decodeJsonWithContext(result, "viewing", describeTarget(target));
+    }
+    let resourceProjection: Record<string, unknown>;
+    try {
+      resourceProjection = target.kind === "file"
+        ? projectFile(decoded, target, target.path, target.ref)
+        : projectResource(decoded, target, input.detail === "expanded");
+    } catch (error) {
+      throw contextualizeMalformedOutput(error, "viewing", target);
     }
     const projection = await budgetProjection(
-      target.kind === "file"
-        ? projectFile(decoded, target, target.path, target.ref)
-        : projectResource(decoded, target, input.detail === "expanded"),
+      resourceProjection,
       input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
       tempOutput,
     );
@@ -568,7 +569,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       ctx,
       async (argv: string[]) =>
         run({ argv, cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target), ciRunHint(input, target)),
-      deps.executor,
+      executeSafely,
     );
     let projection: Record<string, unknown>;
     if (input.kind === "failed_logs") {
@@ -620,7 +621,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       kind: issueMutationResultKind(input.kind),
       target: issueTarget ?? target,
       ...(input.kind === "create_issue" ? { url: parseCreatedResourceUrl(result.stdout, target, "issues") } : {}),
-      output: result.stdout.trim(),
+      output: redactRawSecrets(result.stdout.trim()),
     };
     return { projection, target };
   }
@@ -643,14 +644,14 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: pullRequestEffect(input, target) }, target };
     }
     const result = await run({ argv: buildPullRequestArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
-    const extra = await pullRequestWriteDetails(input, target, ctx, deps.executor);
+    const extra = await pullRequestWriteDetails(input, target, ctx, executeSafely);
     return {
       projection: {
         kind: pullRequestMutationResultKind(input),
         target,
         ...extra,
         ...(input.kind === "create_pull_request" ? { url: parseCreatedResourceUrl(result.stdout, target, "pull") } : {}),
-        output: result.stdout.trim(),
+        output: redactRawSecrets(result.stdout.trim()),
       },
       target,
     };
@@ -661,7 +662,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     ctx: { cwd: string; signal?: AbortSignal },
   ): Promise<{ projection: Record<string, unknown>; target: ApiTarget }> {
     throwIfAborted(ctx.signal);
-    const host = normalizeHost(input.host ?? "github.com");
+    const host = assertSupportedGithubHost(input.host ?? "github.com");
     const endpoint = normalizeApiEndpoint(input.endpoint);
     validateJq(input.jq);
     validateApiCache(input.cache);
@@ -675,20 +676,39 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     const result = await run({ argv: buildApiGetArgv(input, host, endpoint, page, perPage), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, `${host} ${redactSecrets(endpoint)}`);
     const outputBytes = Buffer.byteLength(result.stdout, "utf8");
     if (outputBytes > MAX_API_RESPONSE_BYTES) {
+      const budget = input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET;
       const { path } = await tempOutput.write(result.stdout);
-      const oversized = { kind: "api_get", target: safeTarget, endpoint: safeEndpoint, host, page, perPage, truncated: true, byteCount: outputBytes, tokenBudget: input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, fullPath: path };
-      const projection = await budgetProjection(oversized, input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, tempOutput);
-      return { projection, target: safeTarget };
+      // This branch cannot parse the complete body safely, but a redacted,
+      // bounded raw preview still lets a model recognize the response before
+      // choosing whether the restrictive spill file is needed.
+      const oversized = {
+        kind: "api_get",
+        target: safeTarget,
+        endpoint: safeEndpoint,
+        host,
+        page,
+        perPage,
+        truncated: true,
+        byteCount: outputBytes,
+        tokenCount: estimateProjectionTokens(result.stdout),
+        tokenBudget: budget,
+        fullPath: path,
+      };
+      return {
+        projection: withBoundedPreview(
+          oversized,
+          apiOverflowPreview(redactRawSecrets(result.stdout)),
+          budget,
+          ["target", "endpoint", "host", "page", "perPage", "byteCount"],
+        ),
+        target: safeTarget,
+      };
     }
     let data: unknown;
     if (input.jq) {
       data = result.stdout.trim();
     } else {
-      try {
-        data = JSON.parse(result.stdout);
-      } catch {
-        throw new GhExecutionError("malformed_json", "GitHub API returned malformed JSON.");
-      }
+      data = decodeJsonWithContext(result, "reading API GET", `${host} ${safeEndpoint}`);
     }
     const projection = await budgetProjection({ kind: "api_get", target: safeTarget, endpoint: safeEndpoint, host, page, perPage, data: projectApiData(data) }, input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET, tempOutput);
     return { projection, target: safeTarget };
@@ -716,7 +736,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: actionReleaseEffect(input, target) }, target };
     }
     const result = await run({ argv: buildActionReleaseArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
-    return { projection: { kind: actionReleaseResultKind(input.kind), target, output: result.stdout.trim() }, target };
+    return { projection: { kind: actionReleaseResultKind(input.kind), target, output: redactRawSecrets(result.stdout.trim()) }, target };
   }
 
   return { runView, runSearch, runContent, runFocusedRead, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, runApiGet, ensureHost };
@@ -913,7 +933,7 @@ function compactSearchItem(raw: unknown, expanded: boolean): Record<string, unkn
       if (value[key] !== undefined) result[key] = redactUnknown(value[key]);
     }
   }
-  return result;
+  return redactUnknown(result) as Record<string, unknown>;
 }
 
 function projectFile(raw: unknown, target: ResourceTarget, path: string, ref: string | undefined): Record<string, unknown> {
@@ -1092,6 +1112,38 @@ function decodeJson(result: GhExecResult): unknown {
   }
 }
 
+/** Decode errors are model-facing failures, so every API/view/CI caller names
+ * the attempted operation and normalized resource rather than exposing an
+ * opaque JSON parser error. */
+function decodeJsonWithContext(result: GhExecResult, operation: string, targetDescription: string): unknown {
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    const output = redactRawSecrets(result.stdout.trim());
+    if (!output) {
+      throw new GhExecutionError(
+        "malformed_json",
+        `GitHub returned an empty response while ${operation} ${targetDescription}.`,
+      );
+    }
+    throw new GhExecutionError(
+      "malformed_json",
+      `GitHub returned malformed JSON while ${operation} ${targetDescription}: ${output.slice(0, 300)}`,
+    );
+  }
+}
+
+function contextualizeMalformedOutput(error: unknown, operation: string, target: ResourceTarget): never {
+  if (!(error instanceof GhExecutionError) || error.category !== "malformed_json") throw error;
+  const targetDescription = redactSecrets(describeTarget(target));
+  if (error.message.includes(targetDescription)) throw error;
+  throw new GhExecutionError(
+    "malformed_json",
+    `GitHub returned malformed JSON while ${operation} ${targetDescription}: ${error.message}`,
+    error.details,
+  );
+}
+
 function decodeFocusedReadJson(result: GhExecResult, operation: string, target: ResourceTarget): unknown {
   try {
     return JSON.parse(result.stdout);
@@ -1107,7 +1159,7 @@ function decodeCiJson(result: GhExecResult, kind: Exclude<CiKind, "failed_logs">
   try {
     return JSON.parse(result.stdout);
   } catch {
-    const output = redactSecrets(result.stdout.trim());
+    const output = redactRawSecrets(result.stdout.trim());
     const operation = kind === "pr_checks" ? "pull-request checks" : kind === "view_job" ? "workflow job" : kind === "view_run" ? "workflow run" : "workflow runs";
     if (!output) {
       throw new GhExecutionError("malformed_json", `GitHub returned an empty response while reading ${operation} for ${describeTarget(target)}. The resource may be unavailable or no checks may have run.`);
@@ -1670,11 +1722,14 @@ function validateJq(jq: string | undefined): void {
   if (jq === undefined) return;
   const expression = jq.trim();
   if (expression.includes("(") || expression.includes(")") || expression.includes(";") || expression.includes(",")) {
-    throw new GhExecutionError("validation", "API GET jq projections may only use field access, array access, and slice operators (`.a`, `.a[0]`, `.a[:3]`, `[]`, `.[]`).");
+    throw new GhExecutionError("validation", "API GET jq projections may only use field access, array access, and slice operators (`.a`, `.a[0]`, `.a[:3]`, `.[]`).");
   }
-  const path = /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[0-9]*:[0-9]*\]|\[[0-9]+\]|\[\])+$/;
-  if (expression !== "." && (!expression || expression.split("|").some((part) => !path.test(part.trim())))) {
-    throw new GhExecutionError("validation", "API GET jq projections are limited to data paths, array indexes, and slices (`.a`, `.a[0]`, `.a[:3]`, `[]`).");
+  // Every path begins at jq's input (`.`). This permits real root-array
+  // projections such as `.[0]` and `.[:3]`, while rejecting array literals
+  // like `[0]` that look similar but are not data access.
+  const path = /^(?:\.|\.[A-Za-z_][A-Za-z0-9_]*)(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|\[[0-9]*:[0-9]*\]|\[[0-9]+\]|\[\])*$/;
+  if (!expression || expression.split("|").some((part) => !path.test(part.trim()))) {
+    throw new GhExecutionError("validation", "API GET jq projections are limited to data paths, array indexes, and slices (`.a`, `.[0]`, `.[:3]`, `.[]`).");
   }
 }
 
@@ -1713,7 +1768,10 @@ function buildApiGetArgv(input: ApiGetRequestInput, host: string, endpoint: stri
 function projectApiData(value: unknown): unknown {
   if (typeof value === "string") return redactSecrets(value);
   if (Array.isArray(value)) return value.map(projectApiData);
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactSecrets(key), projectApiData(nested)]));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [
+    redactSecrets(key),
+    isSensitiveKey(key) ? "[redacted]" : projectApiData(nested),
+  ]));
   return value;
 }
 
@@ -1909,9 +1967,9 @@ async function pullRequestWriteDetails(
 ): Promise<Record<string, unknown>> {
   const requested = { method: input.method ?? "merge", deleteBranch: Boolean(input.deleteBranch), event: input.event ?? null } as Record<string, unknown>;
   if (target.kind !== "pull_request") {
-    return input.kind === "create_pull_request"
+    return redactUnknown(input.kind === "create_pull_request"
       ? { requested: { ...requested, head: input.head ?? null, base: input.base ?? null, draft: Boolean(input.draft) } }
-      : {};
+      : {}) as Record<string, unknown>;
   }
   const base: Record<string, unknown> = { requested };
   if (input.kind === "merge_pull_request") {
@@ -1937,7 +1995,7 @@ async function pullRequestWriteDetails(
       base.merged = null;
     }
   }
-  return base;
+  return redactUnknown(base) as Record<string, unknown>;
 }
 
 function isJsonArray(value: string): boolean {
@@ -2005,7 +2063,7 @@ async function runChecks(
           `per_page=${limit}`,
         ];
         const fallback = await executing(fallbackArgv);
-        const decoded = decodeJson(fallback);
+        const decoded = decodeJsonWithContext(fallback, "reading pull-request checks for", describeTarget(target));
         if (decoded && typeof decoded === "object") {
           const runs = (decoded as { check_runs?: unknown[] }).check_runs;
           if (Array.isArray(runs)) {
@@ -2784,6 +2842,24 @@ function compactTruncationValue(value: unknown, maxBytes: number): unknown {
   return boundedUtf8(JSON.stringify(redactUnknown(value)), maxBytes);
 }
 
+function apiOverflowPreview(source: string): string {
+  const scanBytes = 64_000;
+  const head = boundedUtf8(source, scanBytes);
+  const sourceBytes = Buffer.from(source, "utf8");
+  const tail = sourceBytes.length > scanBytes
+    ? sourceBytes.subarray(sourceBytes.length - scanBytes).toString("utf8").replace(/^\uFFFD+/, "")
+    : "";
+  const candidates = `${head}\n${tail}`;
+  const identifiers: string[] = [];
+  const field = /"(id|number|name|title|login|tag_name|html_url|url)"\s*:\s*("(?:\\.|[^"\\])*"|-?[0-9]+|true|false|null)/g;
+  for (const match of candidates.matchAll(field)) {
+    identifiers.push(`"${match[1]}":${match[2]}`);
+    if (identifiers.length >= 8) break;
+  }
+  const raw = boundedUtf8(source, MAX_TRUNCATION_PREVIEW_BYTES);
+  return identifiers.length > 0 ? `Identifiers: {${identifiers.join(",")}}\nPreview: ${raw}` : raw;
+}
+
 function withBoundedPreview(
   envelope: Record<string, unknown>,
   source: string,
@@ -2859,8 +2935,9 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 function boundedDiagnostics(result: GhExecResult): GhExecResult {
   const bound = (value: string) => {
-    const bytes = Buffer.from(value, "utf8");
-    if (bytes.length <= MAX_API_RESPONSE_BYTES) return value;
+    const safeValue = redactRawSecrets(value);
+    const bytes = Buffer.from(safeValue, "utf8");
+    if (bytes.length <= MAX_API_RESPONSE_BYTES) return safeValue;
     const suffix = Buffer.from("…[truncated]", "utf8");
     const limit = Math.max(0, MAX_API_RESPONSE_BYTES - suffix.length);
     let prefix = bytes.subarray(0, limit).toString("utf8");
@@ -2919,7 +2996,10 @@ function redactUnknown(value: unknown): unknown {
   if (typeof value === "string") return redactSecrets(value);
   if (Array.isArray(value)) return value.map(redactUnknown);
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactSecrets(key), redactUnknown(nested)]));
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [
+      redactSecrets(key),
+      isSensitiveKey(key) ? "[redacted]" : redactUnknown(nested),
+    ]));
   }
   return value;
 }

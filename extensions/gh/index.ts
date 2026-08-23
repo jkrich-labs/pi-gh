@@ -1,8 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { GhExecutionError } from "./errors.ts";
+import { GhExecutionError, redactRawSecrets } from "./errors.ts";
 import {
   createPipeline,
   createPiExecutor,
+  redactModelOutput,
   redactResourceTarget,
   type ApiGetRequestInput,
   type ActionReleaseRequestInput,
@@ -154,8 +155,8 @@ function registerViewTool(
         { cwd: ctx.cwd, signal },
       );
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
-        details: { kind: target.kind === "current_checkout" ? "repository" : target.kind, target },
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
+        details: { kind: target.kind === "current_checkout" ? "repository" : target.kind, target: redactModelOutput(target) },
       };
     },
   });
@@ -170,6 +171,7 @@ function registerFindTool(pi: ExtensionAPI, operation: Operation, registry: Oper
     parameters: findParameters,
     async execute(_toolCallId, params) {
       const matches = registry.search(params.query, params.limit ?? 3);
+      const safeQuery = redactRawSecrets(params.query);
       const active = pi.getActiveTools?.() ?? [];
       const names = matches.map((match) => match.name);
       const activated = names.filter((name) => !active.includes(name));
@@ -190,14 +192,14 @@ function registerFindTool(pi: ExtensionAPI, operation: Operation, registry: Oper
           {
             type: "text",
             text: JSON.stringify({
-              query: params.query,
+              query: safeQuery,
               matches: projections,
               activated,
               alreadyActive: names.filter((name) => active.includes(name)),
             }),
           },
         ],
-        details: { query: params.query, matches: names, activated },
+        details: { query: safeQuery, matches: names, activated },
       };
     },
   });
@@ -221,8 +223,8 @@ function registerSearchTool(
         { cwd: ctx.cwd, signal },
       );
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
-        details: { kind: `search_${kind}`, target },
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
+        details: { kind: `search_${kind}`, target: redactModelOutput(target) },
       };
     },
   });
@@ -252,7 +254,7 @@ function registerFocusedReadTool(
       };
       const { projection, target } = await pipeline.runFocusedRead(input, { cwd: ctx.cwd, signal });
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
         details: { kind, target: redactResourceTarget(target) },
       };
     },
@@ -293,8 +295,8 @@ function registerContentTool(pi: ExtensionAPI, operation: Operation, pipeline: R
       };
       const { projection, target } = await pipeline.runContent(input, { cwd: ctx.cwd, signal });
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
-        details: { kind, target },
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
+        details: { kind, target: redactModelOutput(target) },
       };
     },
   });
@@ -339,8 +341,8 @@ function registerCiTool(pi: ExtensionAPI, operation: Operation, pipeline: Return
       };
       const { projection, target } = await pipeline.runCi(input, { cwd: ctx.cwd, signal });
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
-        details: { kind, target },
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
+        details: { kind, target: redactModelOutput(target) },
       };
     },
   });
@@ -379,8 +381,8 @@ function registerIssueTool(pi: ExtensionAPI, operation: Operation, pipeline: Ret
         confirm: extensionContext.ui?.confirm,
       });
       return {
-        content: [{ type: "text", text: JSON.stringify(projection) }],
-        details: { kind, target },
+        content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
+        details: { kind, target: redactModelOutput(target) },
       };
     },
   });
@@ -425,7 +427,7 @@ function registerPullRequestTool(pi: ExtensionAPI, operation: Operation, pipelin
       };
       const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
       const { projection, target } = await pipeline.runPullRequestWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
-      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
+      return { content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }], details: { kind, target: redactModelOutput(target) } };
     },
   });
 }
@@ -469,7 +471,7 @@ function registerActionReleaseTool(pi: ExtensionAPI, operation: Operation, pipel
       };
       const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
       const { projection, target } = await pipeline.runActionReleaseWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
-      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
+      return { content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }], details: { kind, target: redactModelOutput(target) } };
     },
   });
 }
@@ -501,7 +503,7 @@ function registerApiTool(pi: ExtensionAPI, operation: Operation, pipeline: Retur
         detail: values.detail === "compact" || values.detail === "expanded" ? values.detail : undefined,
       };
       const { projection, target } = await pipeline.runApiGet(input, { cwd: ctx.cwd, signal });
-      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
+      return { content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }], details: { kind, target: redactModelOutput(target) } };
     },
   });
 }

@@ -214,10 +214,10 @@
 - **Tier:** general — validation and error contracts are cross-cutting but bounded by existing seams.
 - **Est. cost:** ~10k tokens / 20–30 minutes
 - **Acceptance criteria:**
-  - [ ] `node --test tests/api-get.test.ts tests/view-targets.test.ts tests/regression-hardening.test.ts --test-name-pattern='slice|preview|host|empty|malformed|context'` passes.
-  - [ ] `npm run verify` passes on the integrated tree.
-  - [ ] `npm run smoke:gh` passes without mutation.
-- **Status:** ready
+  - [x] `node --test tests/api-get.test.ts tests/view-targets.test.ts tests/regression-hardening.test.ts --test-name-pattern='slice|preview|host|empty|malformed|context'` passes.
+  - [x] `npm run verify` passes on the integrated tree.
+  - [x] `npm run smoke:gh` passes without mutation.
+- **Status:** complete
 
 ## Cost and dependency summary
 

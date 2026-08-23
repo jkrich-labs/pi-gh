@@ -229,6 +229,46 @@ test("expanded pull-request status checks report bounded counts and aggregate tr
   assert.equal(projection.listsTruncated, true);
 });
 
+test("CI tools report malformed GHES authentication output with host context", async () => {
+  const executor = createFakeExecutor((request) => request.argv[0] === "--version"
+    ? version()
+    : { stdout: "{", stderr: "", code: 0, killed: false });
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_view_workflow_run");
+  assert.ok(tool);
+  await assert.rejects(
+    () => tool.execute(
+      "ci-auth-malformed",
+      { target: "https://ghe/team/project/actions/runs/100" },
+      undefined,
+      undefined,
+      toolCtx() as never,
+    ),
+    (error: unknown) => error instanceof GhExecutionError
+      && error.category === "malformed_json"
+      && /checking authentication.*ghe/i.test(error.message),
+  );
+});
+
+test("malformed view and CI projections name their requested resource", async () => {
+  const cases = [
+    ["gh_view", { target: "https://github.com/cli/cli/issues/7" }, {}, /cli\/cli issue #7/i],
+    ["gh_view_job", { target: "https://github.com/cli/cli/actions/runs/100/job/200" }, {}, /cli\/cli job 200 \(run 100\)/i],
+  ] as const;
+  for (const [name, params, response, context] of cases) {
+    const executor = createFakeExecutor((request) => request.argv[0] === "--version" ? version() : json(response));
+    const { tools } = loadExtension({ executor: executor.execute });
+    const tool = tools.get(name);
+    assert.ok(tool);
+    await assert.rejects(
+      () => tool.execute("malformed-context", params, undefined, undefined, toolCtx() as never),
+      (error: unknown) => error instanceof GhExecutionError
+        && error.category === "malformed_json"
+        && context.test(error.message),
+    );
+  }
+});
+
 test("binary files expose metadata without base64 content", async () => {
   const bytes = Buffer.from([0, 255, 1, 2]);
   const { tool } = viewTool({ type: "file", encoding: "base64", content: bytes.toString("base64"), size: bytes.length, sha: "blob-sha" });
@@ -412,9 +452,12 @@ test("oversized projections spill to readable secure JSON with a bounded preview
     await rm(written.path.slice(0, written.path.lastIndexOf("/")), { recursive: true, force: true });
   }
 
+  const secret = "unrecognised-long-lived-secret-1234567890";
+  let nestedSecret = `Authorization\\u003A\\u0020Bearer\\u0020${secret}`;
+  for (let depth = 0; depth < 10; depth += 1) nestedSecret = nestedSecret.replaceAll("\\", "\\u005c");
   const executor = createFakeExecutor((request) => request.argv[0] === "--version"
     ? version()
-    : json({ name: "cli", nameWithOwner: "cli/cli", description: "x".repeat(20_000) }));
+    : json({ name: "cli", nameWithOwner: "cli/cli", description: `${nestedSecret}\n${"x".repeat(20_000)}` }));
   const loaded = loadExtension({
     executor: executor.execute,
     tempOutput: { async write() { return { path: "/tmp/pi-gh-private/full-output" }; } },
@@ -425,6 +468,8 @@ test("oversized projections spill to readable secure JSON with a bounded preview
   const projection = projectionOf(result) as Record<string, unknown>;
   assert.equal(projection.truncated, true);
   assert.equal(typeof projection.preview, "string");
+  assert.doesNotMatch(JSON.stringify(projection), new RegExp(secret));
+  assert.match(JSON.stringify(projection), /\[redacted\]/);
   assert.ok((projection.preview as string).length <= 1_000);
   assert.ok(estimateProjectionTokens(JSON.stringify(projection)) <= 2_000);
 });

@@ -31,11 +31,17 @@ export interface ResolveTargetOptions {
 
 export function resolveResourceTarget(raw: string | undefined, options: ResolveTargetOptions = {}): ResourceTarget {
   const trimmed = raw?.trim() ?? "";
-  if (trimmed === "" || trimmed === ".") {
+  // Omission deliberately means the current checkout. An explicit empty
+  // string is almost always a lost model argument and must not silently read
+  // whichever checkout happens to be active.
+  if (raw === undefined || trimmed === ".") {
     if (options.kind && options.kind !== "repository") {
       throw new GhExecutionError("validation", "The current checkout can only be viewed as a repository.");
     }
     return { kind: "current_checkout" };
+  }
+  if (trimmed === "") {
+    throw new GhExecutionError("validation", "Resource target must not be empty. Omit target to use the current checkout.");
   }
 
   if (/^https?:\/\//i.test(trimmed)) {
@@ -104,7 +110,39 @@ export function isGithubHost(host: string): boolean {
   return normalizeHost(host) === "github.com";
 }
 
+const UNSUPPORTED_GITHUB_HOSTS = new Set([
+  "api.github.com",
+  "codeload.github.com",
+  "gist.github.com",
+  "raw.githubusercontent.com",
+  "uploads.github.com",
+  "gitlab.com",
+  "www.gitlab.com",
+  "bitbucket.org",
+  "www.bitbucket.org",
+]);
+
+/** Reject GitHub service/content endpoints and known non-GitHub forges.
+ * Unknown valid hostnames remain possible GHES installations and are checked
+ * against `gh auth status` by the execution pipeline. */
+export function assertSupportedGithubHost(raw: string): string {
+  const host = normalizeHost(raw);
+  if (
+    !host
+    || !/^(?:\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)$/i.test(host)
+    || UNSUPPORTED_GITHUB_HOSTS.has(host)
+    || host.endsWith(".githubusercontent.com")
+  ) {
+    throw new GhExecutionError(
+      "validation",
+      `Unsupported GitHub host: ${host || "(empty)"}. Use github.com or an authenticated GitHub Enterprise host.`,
+    );
+  }
+  return host;
+}
+
 function fromHostPath(host: string, pathname: string): ResourceTarget {
+  host = assertSupportedGithubHost(host);
   const parts = pathname
     .split("/")
     .filter(Boolean)
@@ -186,7 +224,7 @@ function repository(host: string, owner: string, name: string): ResourceTarget {
   if (!owner || !name || owner.includes("#") || name.includes("#")) {
     throw new GhExecutionError("validation", "Repository resource target needs an owner and name.");
   }
-  return { kind: "repository", host: normalizeHost(host), owner, name };
+  return { kind: "repository", host: assertSupportedGithubHost(host), owner, name };
 }
 
 function issueTarget(host: string, owner: string, name: string, rawNumber: string | undefined, length: number): ResourceTarget {

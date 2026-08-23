@@ -326,6 +326,23 @@ test("gh_find scopes issue searches and comment reads to the requested resources
   assert.deepEqual(projection.matches.map((match) => match.name), ["gh_search_issues", "gh_issue_comments"]);
 });
 
+test("gh_find redacts private keys from content and details", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const privateKey = `-----BEGIN PGP PRIVATE KEY BLOCK-----\n${"P".repeat(200)}\n-----END PGP PRIVATE KEY BLOCK-----`;
+  const result = await tool.execute(
+    "find-secret-query",
+    { query: privateKey, limit: 3 },
+    undefined,
+    undefined,
+    toolCtx() as never,
+  );
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /BEGIN PGP PRIVATE KEY|P{20}/);
+  assert.match(serialized, /\[redacted\]/);
+});
+
 test("gh_view remains callable after additive loading", async () => {
   const loaded = loadExtension({ executor: scriptedExecutor().execute }, { activeTools: ["read"] });
   const tool = loaded.tools.get("gh_view");
