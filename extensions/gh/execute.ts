@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
+import type { ActionReleaseKind, CiKind, IssueKind, PullRequestKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -100,6 +100,23 @@ export interface PullRequestRequestInput {
   event?: "approve" | "request_changes" | "comment";
   method?: "merge" | "squash" | "rebase";
   deleteBranch?: boolean;
+}
+
+export interface ActionReleaseRequestInput {
+  kind: ActionReleaseKind;
+  repo?: string;
+  workflow?: string;
+  ref?: string;
+  inputs?: Record<string, string>;
+  target?: string;
+  tag?: string;
+  title?: string;
+  notes?: string;
+  draft?: boolean;
+  prerelease?: boolean;
+  path?: string;
+  label?: string;
+  asset?: string;
 }
 
 export interface GhExecRequest {
@@ -460,7 +477,32 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     };
   }
 
-  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, ensureHost };
+  async function runActionReleaseWrite(
+    input: ActionReleaseRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    const target = input.kind === "dispatch_workflow" || input.kind === "create_release"
+      ? resolveRepositoryTarget(input.repo ?? "")
+      : input.kind === "cancel_workflow_run" || input.kind === "rerun_workflow_run"
+        ? resolveResourceTarget(input.target ?? "", { kind: "workflow_run" })
+        : resolveReleaseTarget(input.target ?? "");
+    if (target.kind === "current_checkout") throw new GhExecutionError("validation", "An explicit GitHub resource target is required.");
+    if (input.kind === "upload_release_asset") validateAssetPath(input.path ?? "");
+    await ensureGh(ctx.signal);
+    await ensureHost(target.host, ctx.signal);
+    const guarded = input.kind !== "edit_release" && input.kind !== "upload_release_asset";
+    if (guarded) {
+      const ask = ctx.confirm ?? confirm;
+      if (!ctx.hasUI || !ask) throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
+      const approved = await ask("Confirm GitHub write", actionReleaseEffect(input, target));
+      if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: actionReleaseEffect(input, target) }, target };
+    }
+    const result = await run({ argv: buildActionReleaseArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS });
+    return { projection: { kind: actionReleaseResultKind(input.kind), target, output: result.stdout.trim() }, target };
+  }
+
+  return { runView, runSearch, runContent, runCi, runIssueWrite, runPullRequestWrite, runActionReleaseWrite, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -1020,6 +1062,57 @@ function buildPullRequestArgv(input: PullRequestRequestInput, target: ResourceTa
 function targetPullRequestNumber(target: ResourceTarget): number {
   if (target.kind !== "pull_request") throw new GhExecutionError("validation", "A pull-request target is required.");
   return target.number;
+}
+
+function resolveReleaseTarget(raw: string): Extract<ResourceTarget, { kind: "release" }> {
+  const target = resolveResourceTarget(raw, { kind: "release" });
+  if (target.kind !== "release") throw new GhExecutionError("validation", "A release target is required.");
+  return target;
+}
+
+function actionReleaseResultKind(kind: ActionReleaseKind): string {
+  const names: Record<ActionReleaseKind, string> = {
+    dispatch_workflow: "workflow_dispatched",
+    cancel_workflow_run: "workflow_run_cancelled",
+    rerun_workflow_run: "workflow_run_rerun",
+    create_release: "release_created",
+    edit_release: "release_edited",
+    upload_release_asset: "release_asset_uploaded",
+    delete_release: "release_deleted",
+    delete_release_asset: "release_asset_deleted",
+  };
+  return names[kind];
+}
+
+function actionReleaseEffect(input: ActionReleaseRequestInput, target: ResourceTarget): string {
+  const repository = formatRepositoryTarget(target) ?? "repository";
+  if (input.kind === "dispatch_workflow") return `Dispatch workflow ${input.workflow ?? ""} on ${repository}`;
+  if (input.kind === "cancel_workflow_run") return `Cancel workflow run ${repository}#${targetRunId(target)}`;
+  if (input.kind === "rerun_workflow_run") return `Rerun workflow run ${repository}#${targetRunId(target)}`;
+  const tag = target.kind === "release" ? target.tag : input.tag ?? "";
+  if (input.kind === "create_release") return `Publish release ${repository}@${input.tag ?? ""}`;
+  if (input.kind === "delete_release") return `Delete release ${repository}@${tag}`;
+  if (input.kind === "delete_release_asset") return `Delete release asset ${repository}@${tag}/${input.asset ?? ""}`;
+  return `${input.kind.replace(/_/g, " ")} ${repository}@${tag}`;
+}
+
+function buildActionReleaseArgv(input: ActionReleaseRequestInput, target: ResourceTarget): string[] {
+  const repository = cliRepositoryTarget(target);
+  if (input.kind === "dispatch_workflow") return ["workflow", "run", input.workflow ?? "", "--repo", repository, ...(input.ref ? ["--ref", input.ref] : []), ...Object.entries(input.inputs ?? {}).flatMap(([key, value]) => ["-f", `${key}=${value}`])];
+  if (input.kind === "cancel_workflow_run") return ["run", "cancel", String(targetRunId(target)), "--repo", repository];
+  if (input.kind === "rerun_workflow_run") return ["run", "rerun", String(targetRunId(target)), "--repo", repository];
+  const tag = target.kind === "release" ? target.tag : input.tag ?? "";
+  if (input.kind === "create_release") return ["release", "create", input.tag ?? "", "--repo", repository, ...(input.title ? ["--title", input.title] : []), ...(input.notes ? ["--notes", input.notes] : []), ...(input.draft ? ["--draft"] : []), ...(input.prerelease ? ["--prerelease"] : [])];
+  if (input.kind === "edit_release") return ["release", "edit", tag, "--repo", repository, ...(input.title ? ["--title", input.title] : []), ...(input.notes ? ["--notes", input.notes] : []), ...(input.draft === true ? ["--draft"] : input.draft === false ? ["--draft=false"] : []), ...(input.prerelease === true ? ["--prerelease"] : input.prerelease === false ? ["--prerelease=false"] : [])];
+  if (input.kind === "upload_release_asset") return ["release", "upload", tag, `${input.path ?? ""}${input.label ? `#${input.label}` : ""}`, "--repo", repository];
+  if (input.kind === "delete_release") return ["release", "delete", tag, "--repo", repository, "--yes"];
+  return ["release", "delete-asset", input.asset ?? "", "--repo", repository, "--yes"];
+}
+
+function validateAssetPath(path: string): void {
+  if (!path || path.includes("\\") || path.includes("\u0000") || path.split("/").some((part) => part === "..")) {
+    throw new GhExecutionError("validation", "Release asset paths must be non-empty and must not contain traversal segments.");
+  }
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {

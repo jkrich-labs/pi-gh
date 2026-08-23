@@ -103,6 +103,25 @@ test("gh_find loads exact pull request write tools", async () => {
   }
 });
 
+test("gh_find loads dispatch rerun cancel and release tools", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const cases = [
+    ["dispatch workflow", "gh_dispatch_workflow"],
+    ["cancel workflow run", "gh_cancel_workflow_run"],
+    ["rerun workflow run", "gh_rerun_workflow_run"],
+    ["create release", "gh_create_release"],
+    ["upload release asset", "gh_upload_release_asset"],
+    ["delete release", "gh_delete_release"],
+  ] as const;
+  for (const [query, expected] of cases) {
+    const projection = projectionOf(await tool.execute(query, { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as { matches: Array<{ name: string }> };
+    assert.equal(projection.matches[0]?.name, expected);
+    assert.equal(loaded.activeTools.includes(expected), true);
+  }
+});
+
 test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");

@@ -274,6 +274,59 @@ export const updatePullRequestBranchParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const dispatchWorkflowParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    workflow: Type.String({ description: "Workflow file or identifier" }),
+    ref: Type.Optional(Type.String({ description: "Branch or ref" })),
+    inputs: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Workflow input values" })),
+  },
+  { additionalProperties: false },
+);
+
+export const workflowRunWriteParameters = Type.Object(
+  { target: Type.String({ description: "Workflow-run URL" }) },
+  { additionalProperties: false },
+);
+
+export const createReleaseParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    tag: Type.String({ description: "Release tag" }),
+    title: Type.Optional(Type.String()),
+    notes: Type.Optional(Type.String()),
+    draft: Type.Optional(Type.Boolean()),
+    prerelease: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const editReleaseParameters = Type.Object(
+  {
+    target: Type.String({ description: "Release URL or owner/repo@tag" }),
+    title: Type.Optional(Type.String()),
+    notes: Type.Optional(Type.String()),
+    draft: Type.Optional(Type.Boolean()),
+    prerelease: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const uploadReleaseAssetParameters = Type.Object(
+  { target: Type.String({ description: "Release URL or owner/repo@tag" }), path: Type.String({ description: "Local asset path" }), label: Type.Optional(Type.String()) },
+  { additionalProperties: false },
+);
+
+export const deleteReleaseParameters = Type.Object(
+  { target: Type.String({ description: "Release URL or owner/repo@tag" }) },
+  { additionalProperties: false },
+);
+
+export const deleteReleaseAssetParameters = Type.Object(
+  { target: Type.String({ description: "Release URL or owner/repo@tag" }), asset: Type.String({ description: "Release asset name" }) },
+  { additionalProperties: false },
+);
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -657,6 +710,31 @@ export const pullRequestOperations: readonly Operation[] = [
   writeOperation("guarded", { name: "gh_update_pull_request_branch", label: "Update Pull Request Branch", description: "Update a pull-request branch after confirming the compute effect.", aliases: ["update pull request branch", "update pr branch", "sync pull request"], keywords: ["pull", "request", "branch", "update", "sync", "compute"], resourceKind: "pull request", verb: "update branch", parameters: updatePullRequestBranchParameters, argvFixture: ["pr", "update-branch", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "update-branch", "1", "--repo", "OWNER/REPO"] }),
 ];
 
+export const actionReleaseOperationKinds = {
+  gh_dispatch_workflow: "dispatch_workflow",
+  gh_cancel_workflow_run: "cancel_workflow_run",
+  gh_rerun_workflow_run: "rerun_workflow_run",
+  gh_create_release: "create_release",
+  gh_edit_release: "edit_release",
+  gh_upload_release_asset: "upload_release_asset",
+  gh_delete_release: "delete_release",
+  gh_delete_release_asset: "delete_release_asset",
+} as const;
+
+export type ActionReleaseOperationName = keyof typeof actionReleaseOperationKinds;
+export type ActionReleaseKind = (typeof actionReleaseOperationKinds)[ActionReleaseOperationName];
+
+export const actionReleaseOperations: readonly Operation[] = [
+  writeOperation("guarded", { name: "gh_dispatch_workflow", label: "Dispatch Workflow", description: "Dispatch a workflow on a selected ref with typed inputs after confirmation.", aliases: ["dispatch workflow", "run workflow", "workflow dispatch"], keywords: ["workflow", "dispatch", "ref", "inputs", "compute"], resourceKind: "workflow", verb: "dispatch", parameters: dispatchWorkflowParameters, argvFixture: ["workflow", "run", "build.yml", "--repo", "OWNER/REPO"], buildArgv: () => ["workflow", "run", "build.yml"] }),
+  writeOperation("guarded", { name: "gh_cancel_workflow_run", label: "Cancel Workflow Run", description: "Cancel a workflow run after confirming the compute effect.", aliases: ["cancel workflow run", "cancel run", "stop workflow"], keywords: ["workflow", "run", "cancel", "stop", "compute"], resourceKind: "workflow run", verb: "cancel", parameters: workflowRunWriteParameters, argvFixture: ["run", "cancel", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "cancel", "1"] }),
+  writeOperation("guarded", { name: "gh_rerun_workflow_run", label: "Rerun Workflow Run", description: "Rerun a workflow after confirming the compute effect.", aliases: ["rerun workflow run", "rerun run", "retry workflow"], keywords: ["workflow", "run", "rerun", "retry", "compute"], resourceKind: "workflow run", verb: "rerun", parameters: workflowRunWriteParameters, argvFixture: ["run", "rerun", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "rerun", "1"] }),
+  writeOperation("guarded", { name: "gh_create_release", label: "Create Release", description: "Create and publish a release after confirming the publication effect.", aliases: ["create release", "publish release", "new release"], keywords: ["release", "create", "publish", "tag"], resourceKind: "release", verb: "create", parameters: createReleaseParameters, argvFixture: ["release", "create", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "create", "v1"] }),
+  writeOperation("routine", { name: "gh_edit_release", label: "Edit Release", description: "Edit release metadata without changing publication state.", aliases: ["edit release", "release metadata"], keywords: ["release", "edit", "notes", "draft", "prerelease"], resourceKind: "release", verb: "edit", parameters: editReleaseParameters, argvFixture: ["release", "edit", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "edit", "v1"] }),
+  writeOperation("routine", { name: "gh_upload_release_asset", label: "Upload Release Asset", description: "Upload a validated local file to a release.", aliases: ["upload release asset", "release asset", "upload asset"], keywords: ["release", "asset", "upload", "file"], resourceKind: "release asset", verb: "upload", parameters: uploadReleaseAssetParameters, argvFixture: ["release", "upload", "v1", "asset.zip", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "upload", "v1", "asset.zip"] }),
+  writeOperation("guarded", { name: "gh_delete_release", label: "Delete Release", description: "Delete a release after confirming the deletion effect.", aliases: ["delete release", "remove release"], keywords: ["release", "delete", "remove"], resourceKind: "release", verb: "delete", parameters: deleteReleaseParameters, argvFixture: ["release", "delete", "v1", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete", "v1"] }),
+  writeOperation("guarded", { name: "gh_delete_release_asset", label: "Delete Release Asset", description: "Delete a release asset after confirming the deletion effect.", aliases: ["delete release asset", "delete asset", "remove asset"], keywords: ["release", "asset", "delete", "remove"], resourceKind: "release asset", verb: "delete", parameters: deleteReleaseAssetParameters, argvFixture: ["release", "delete-asset", "asset.zip", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete-asset", "asset.zip"] }),
+];
+
 export interface OperationRegistry {
   readonly operations: readonly Operation[];
   get(name: string): Operation | undefined;
@@ -665,7 +743,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...pullRequestOperations, ...actionReleaseOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {

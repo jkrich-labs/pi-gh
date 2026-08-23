@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createPipeline,
   createPiExecutor,
+  type ActionReleaseRequestInput,
   type ContentRequestInput,
   type GhDependencies,
   type IssueRequestInput,
@@ -9,11 +10,17 @@ import {
   type SearchRequestInput,
 } from "./execute.ts";
 import {
+  actionReleaseOperationKinds,
   checksParameters,
+  createReleaseParameters,
+  deleteReleaseAssetParameters,
+  deleteReleaseParameters,
+  dispatchWorkflowParameters,
   ciOperationKinds,
   createIssueParameters,
   createRegistry,
   editIssueParameters,
+  editReleaseParameters,
   failedLogsParameters,
   findParameters,
   issueOperationKinds,
@@ -32,10 +39,13 @@ import {
   pullRequestFilesParameters,
   readFileParameters,
   searchParameters,
+  uploadReleaseAssetParameters,
+  workflowRunWriteParameters,
   listWorkflowRunsParameters,
   workflowRunParameters,
   searchOperationKinds,
   type Operation,
+  type ActionReleaseKind,
   type CiKind,
   type OperationRegistry,
   type PullRequestKind,
@@ -86,6 +96,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerIssueTool(pi, operation, pipeline, issueOperationKinds[operation.name as keyof typeof issueOperationKinds]);
       } else if (operation.name in pullRequestOperationKinds) {
         registerPullRequestTool(pi, operation, pipeline, pullRequestOperationKinds[operation.name as keyof typeof pullRequestOperationKinds]);
+      } else if (operation.name in actionReleaseOperationKinds) {
+        registerActionReleaseTool(pi, operation, pipeline, actionReleaseOperationKinds[operation.name as keyof typeof actionReleaseOperationKinds]);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -358,6 +370,50 @@ function registerPullRequestTool(pi: ExtensionAPI, operation: Operation, pipelin
       };
       const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
       const { projection, target } = await pipeline.runPullRequestWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
+      return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
+    },
+  });
+}
+
+function registerActionReleaseTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>, kind: ActionReleaseKind): void {
+  const schema = operation.name === "gh_dispatch_workflow"
+    ? dispatchWorkflowParameters
+    : operation.name === "gh_cancel_workflow_run" || operation.name === "gh_rerun_workflow_run"
+      ? workflowRunWriteParameters
+      : operation.name === "gh_create_release"
+        ? createReleaseParameters
+        : operation.name === "gh_edit_release"
+          ? editReleaseParameters
+          : operation.name === "gh_upload_release_asset"
+            ? uploadReleaseAssetParameters
+            : operation.name === "gh_delete_release"
+              ? deleteReleaseParameters
+              : deleteReleaseAssetParameters;
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const input: ActionReleaseRequestInput = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        workflow: typeof values.workflow === "string" ? values.workflow : undefined,
+        ref: typeof values.ref === "string" ? values.ref : undefined,
+        inputs: values.inputs && typeof values.inputs === "object" ? Object.fromEntries(Object.entries(values.inputs).filter(([, value]) => typeof value === "string")) as Record<string, string> : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        tag: typeof values.tag === "string" ? values.tag : undefined,
+        title: typeof values.title === "string" ? values.title : undefined,
+        notes: typeof values.notes === "string" ? values.notes : undefined,
+        draft: typeof values.draft === "boolean" ? values.draft : undefined,
+        prerelease: typeof values.prerelease === "boolean" ? values.prerelease : undefined,
+        path: typeof values.path === "string" ? values.path : undefined,
+        label: typeof values.label === "string" ? values.label : undefined,
+        asset: typeof values.asset === "string" ? values.asset : undefined,
+      };
+      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
+      const { projection, target } = await pipeline.runActionReleaseWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
       return { content: [{ type: "text", text: JSON.stringify(projection) }], details: { kind, target } };
     },
   });
