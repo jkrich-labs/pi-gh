@@ -172,7 +172,7 @@ test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () =
   }
 });
 
-test("gh_find keeps explicit read intent free of routine and guarded operations", async () => {
+test("gh_find keeps explicit read intent free of write operations", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");
   assert.ok(tool);

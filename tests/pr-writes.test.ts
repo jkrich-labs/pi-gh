@@ -3,11 +3,11 @@ import { test } from "node:test";
 import { GhExecutionError } from "../extensions/gh/index.ts";
 import { createFakeExecutor, loadExtension, projectionOf, toolCtx } from "./helpers.ts";
 
-function load(name: string, response = "https://github.com/cli/cli/pull/12\n", confirm?: () => Promise<boolean>) {
+function load(name: string, response = "https://github.com/cli/cli/pull/12\n") {
   const executor = createFakeExecutor((request) => request.argv[0] === "--version"
     ? { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false }
     : { stdout: response, stderr: "", code: 0, killed: false });
-  const loaded = loadExtension({ executor: executor.execute, confirm });
+  const loaded = loadExtension({ executor: executor.execute });
   const tool = loaded.tools.get(name);
   assert.ok(tool, `${name} must be registered`);
   return { executor, tool };
@@ -28,11 +28,11 @@ test("pull-request comment, review, close, reopen, merge, and branch update use 
   await comment.tool.execute("pr-comment", { target: "cli/cli#12", body: "comment" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(comment.executor.calls[1]?.argv, ["pr", "comment", "12", "--repo", "cli/cli", "--body", "comment"]);
 
-  const review = load("gh_review_pull_request", "reviewed\n", async () => true);
+  const review = load("gh_review_pull_request", "reviewed\n");
   await review.tool.execute("pr-review", { target: "https://github.com/cli/cli/pull/12", event: "approve", body: "LGTM" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(review.executor.calls[1]?.argv, ["pr", "review", "12", "--repo", "cli/cli", "--approve", "--body", "LGTM"]);
 
-  const close = load("gh_close_pull_request", "closed\n", async () => true);
+  const close = load("gh_close_pull_request", "closed\n");
   await close.tool.execute("pr-close", { target: "https://github.com/cli/cli/pull/12" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(close.executor.calls[1]?.argv, ["pr", "close", "12", "--repo", "cli/cli"]);
 
@@ -40,12 +40,12 @@ test("pull-request comment, review, close, reopen, merge, and branch update use 
   await reopen.tool.execute("pr-reopen", { target: "https://github.com/cli/cli/pull/12" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(reopen.executor.calls[1]?.argv, ["pr", "reopen", "12", "--repo", "cli/cli"]);
 
-  const merge = load("gh_merge_pull_request", "merged\n", async () => true);
+  const merge = load("gh_merge_pull_request", "merged\n");
   const merged = await merge.tool.execute("pr-merge", { target: "https://github.com/cli/cli/pull/12", method: "squash", deleteBranch: true }, undefined, undefined, toolCtx() as never);
   assert.equal((projectionOf(merged) as { kind: string }).kind, "pull_request_merged");
   assert.deepEqual(merge.executor.calls[1]?.argv, ["pr", "merge", "12", "--repo", "cli/cli", "--squash", "--delete-branch"]);
 
-  const update = load("gh_update_pull_request_branch", "updated\n", async () => true);
+  const update = load("gh_update_pull_request_branch", "updated\n");
   await update.tool.execute("pr-update", { target: "https://github.com/cli/cli/pull/12" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(update.executor.calls[1]?.argv, ["pr", "update-branch", "12", "--repo", "cli/cli"]);
 });
@@ -60,7 +60,7 @@ test("pull-request writes classify conflict, mergeability, required checks, and 
     const executor = createFakeExecutor((request) => request.argv[0] === "--version"
       ? { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false }
       : { stdout: "", stderr, code: 1, killed: false });
-    const loaded = loadExtension({ executor: executor.execute, confirm: async () => true });
+    const loaded = loadExtension({ executor: executor.execute });
     const tool = loaded.tools.get("gh_merge_pull_request");
     assert.ok(tool);
     await assert.rejects(

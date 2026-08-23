@@ -2,7 +2,7 @@
 
 `pi-gh` gives pi a compact, typed interface to GitHub through the authenticated `gh` CLI.
 
-The package does not bundle `gh`, store credentials, or accept shell commands. It executes fixed argv arrays and keeps routine results within token budgets.
+The package does not bundle `gh`, store credentials, or accept shell commands. It executes fixed argv arrays and keeps results within token budgets.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ Use `gh_find` for less common operations. It activates only the exact operation 
 ## Safety
 
 - GitHub writes use exact operation tools rather than arbitrary argv.
-- Guarded writes ask for confirmation and fail closed without confirmation UI.
+- Write tools execute directly; pi or its harness applies any permission policy.
 - The API fallback permits only relative REST GET paths, typed query fields, authenticated hosts, bounded pagination, and safe path projections.
 - GraphQL, mutation methods, headers, request bodies, input files, binary downloads, and raw shell syntax are rejected.
 - Credentials are not stored and are redacted from projections, errors, diagnostics, and temporary output.

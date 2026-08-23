@@ -16,7 +16,7 @@ test("every registered operation has strict metadata and executable contract fix
     assert.ok(operation.aliases.length > 0);
     assert.ok(operation.resourceKind);
     assert.ok(operation.verb);
-    assert.ok(["read", "routine", "guarded"].includes(operation.classification));
+    assert.ok(["read", "write"].includes(operation.classification));
     const schema = operation.parameters as TSchemaLike;
     assert.equal(schema.type, "object");
     assert.equal(schema.additionalProperties, false);

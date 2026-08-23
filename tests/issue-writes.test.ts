@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createFakeExecutor, loadExtension, projectionOf, toolCtx } from "./helpers.ts";
 
-function load(name: string, confirm?: () => Promise<boolean>) {
+function load(name: string) {
   const executor = createFakeExecutor((request) => request.argv[0] === "--version"
     ? { stdout: "gh version 2.81.0\n", stderr: "", code: 0, killed: false }
     : { stdout: "https://github.com/cli/cli/issues/42\n", stderr: "", code: 0, killed: false });
-  const loaded = loadExtension({ executor: executor.execute, confirm });
+  const loaded = loadExtension({ executor: executor.execute });
   const tool = loaded.tools.get(name);
   assert.ok(tool, `${name} must be registered`);
   return { executor, tool };
@@ -27,12 +27,12 @@ test("issue write tools create, comment, edit metadata, assign, and label with e
   assert.deepEqual(edit.executor.calls[1]?.argv, ["issue", "edit", "42", "--repo", "cli/cli", "--title", "Updated", "--body", "quoted \"body\"", "--add-assignee", "alice", "--add-label", "bug"]);
 });
 
-test("issue reopen and guarded close return stable mutation projections", async () => {
+test("issue reopen and close return stable mutation projections", async () => {
   const reopen = load("gh_reopen_issue");
   const reopened = await reopen.tool.execute("issue-reopen", { target: "https://github.com/cli/cli/issues/42" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(projectionOf(reopened), { kind: "issue_reopened", target: { kind: "issue", host: "github.com", owner: "cli", name: "cli", number: 42 }, output: "https://github.com/cli/cli/issues/42" });
 
-  const close = load("gh_close_issue", async () => true);
+  const close = load("gh_close_issue");
   const closed = await close.tool.execute("issue-close", { target: "https://github.com/cli/cli/issues/42" }, undefined, undefined, toolCtx() as never);
   assert.deepEqual(projectionOf(closed), { kind: "issue_closed", target: { kind: "issue", host: "github.com", owner: "cli", name: "cli", number: 42 }, output: "https://github.com/cli/cli/issues/42" });
 });

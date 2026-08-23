@@ -18,8 +18,8 @@
     "args": {"endpoint": "repos/cli/cli/issues"}
   },
   {
-    "name": "guarded close",
-    "prompt": "Call gh_find for issue closure, then call gh_close_issue exactly once for cli/cli#1. It may fail closed because this run has no confirmation UI; do not substitute gh_view.",
+    "name": "issue closure",
+    "prompt": "Call gh_find for issue closure, then call gh_close_issue exactly once for cli/cli#1. Do not substitute gh_view.",
     "tools": ["gh_find", "gh_close_issue"],
     "args": {"target": "cli/cli#1"}
   }

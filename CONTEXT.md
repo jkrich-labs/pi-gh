@@ -20,6 +20,6 @@ _Avoid_: gh wrapper, command tool
 The compact, resource-specific result returned to the model, with optional explicit expansion for more fields or detail.
 _Avoid_: Summary, raw output, formatted response
 
-**Guarded write**:
-A GitHub mutation that needs explicit user confirmation because it changes lifecycle or merge state, triggers compute, or deletes data.
-_Avoid_: Destructive action, dangerous command
+**Write**:
+A GitHub operation that changes data or triggers work. Pi or its harness applies any permission policy.
+_Avoid_: Mutation command, destructive action

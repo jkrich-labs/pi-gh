@@ -200,7 +200,7 @@ test("PR create and review send an explicit body flag", async () => {
     () => ({ stdout: "https://github.com/cli/cli/pull/1\n", stderr: "", code: 0, killed: false }),
     () => ({ stdout: "https://github.com/cli/cli/pull/1\n", stderr: "", code: 0, killed: false }),
   ]);
-  const loaded = loadExtension({ executor: executor.execute, confirm: async () => true });
+  const loaded = loadExtension({ executor: executor.execute });
   const create = loaded.tools.get("gh_create_pull_request");
   assert.ok(create);
   await create.execute("pr-create", { repo: "cli/cli", title: "T", head: "feature" }, undefined, undefined, toolCtx() as never);
@@ -216,7 +216,7 @@ test("PR create and review send an explicit body flag", async () => {
 
 test("comment review without a body is rejected with a clear message", async () => {
   const executor = scripted([]);
-  const { tools } = loadExtension({ executor: executor.execute, confirm: async () => true });
+  const { tools } = loadExtension({ executor: executor.execute });
   const tool = tools.get("gh_review_pull_request");
   assert.ok(tool);
   await assert.rejects(

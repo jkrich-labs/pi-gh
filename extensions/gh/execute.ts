@@ -193,7 +193,6 @@ export function redactResourceTarget(target: ResourceTarget): ResourceTarget {
 
 export interface GhDependencies {
   executor?: GhExecutor;
-  confirm?: (title: string, message: string) => Promise<boolean>;
   clock?: { now(): number };
   tempOutput?: TempOutput;
 }
@@ -247,9 +246,8 @@ export function createPiExecutor(pi: ExtensionAPI): GhExecutor {
     });
 }
 
-export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOutput; confirm?: (title: string, message: string) => Promise<boolean> }) {
+export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOutput }) {
   const tempOutput = deps.tempOutput ?? createSecureTempOutput();
-  const confirm = deps.confirm;
   const authenticatedHosts = new Set<string>(["github.com"]);
   let ready = false;
   let hostsLoaded = false;
@@ -591,7 +589,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
 
   async function runIssueWrite(
     input: IssueRequestInput,
-    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+    ctx: { cwd: string; signal?: AbortSignal },
   ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
     throwIfAborted(ctx.signal);
     const target = input.kind === "create_issue"
@@ -600,17 +598,6 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     await ensureGh(ctx.signal);
     await ensureHost(target.host, ctx.signal);
     const issueTarget = input.kind === "create_issue" ? undefined : target;
-    const effect = issueEffect(input.kind, target);
-    if (input.kind === "close_issue") {
-      const ask = ctx.confirm ?? confirm;
-      if (!ctx.hasUI || !ask) {
-        throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
-      }
-      const approved = await ask("Confirm GitHub write", effect);
-      if (!approved) {
-        return { projection: { kind: "cancelled", cancelled: true, target, effect }, target };
-      }
-    }
     const result = await run({
       argv: buildIssueArgv(input, target),
       cwd: ctx.cwd,
@@ -628,7 +615,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
 
   async function runPullRequestWrite(
     input: PullRequestRequestInput,
-    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+    ctx: { cwd: string; signal?: AbortSignal },
   ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
     throwIfAborted(ctx.signal);
     const target = input.kind === "create_pull_request"
@@ -636,13 +623,6 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
       : resolvePullRequestTarget(input.target ?? "");
     await ensureGh(ctx.signal);
     await ensureHost(target.host, ctx.signal);
-    const guarded = input.kind === "close_pull_request" || input.kind === "merge_pull_request" || input.kind === "update_pull_request_branch" || (input.kind === "review_pull_request" && input.event !== "comment");
-    if (guarded) {
-      const ask = ctx.confirm ?? confirm;
-      if (!ctx.hasUI || !ask) throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
-      const approved = await ask("Confirm GitHub write", pullRequestEffect(input, target));
-      if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: pullRequestEffect(input, target) }, target };
-    }
     const result = await run({ argv: buildPullRequestArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
     const extra = await pullRequestWriteDetails(input, target, ctx, executeSafely);
     return {
@@ -716,7 +696,7 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
 
   async function runActionReleaseWrite(
     input: ActionReleaseRequestInput,
-    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+    ctx: { cwd: string; signal?: AbortSignal },
   ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
     throwIfAborted(ctx.signal);
     const target = input.kind === "dispatch_workflow" || input.kind === "create_release"
@@ -728,13 +708,6 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     if (input.kind === "upload_release_asset") validateAssetPath(input.path ?? "");
     await ensureGh(ctx.signal);
     await ensureHost(target.host, ctx.signal);
-    const guarded = input.kind !== "edit_release" && input.kind !== "upload_release_asset";
-    if (guarded) {
-      const ask = ctx.confirm ?? confirm;
-      if (!ctx.hasUI || !ask) throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
-      const approved = await ask("Confirm GitHub write", actionReleaseEffect(input, target));
-      if (!approved) return { projection: { kind: "cancelled", cancelled: true, target, effect: actionReleaseEffect(input, target) }, target };
-    }
     const result = await run({ argv: buildActionReleaseArgv(input, target), cwd: ctx.cwd, signal: ctx.signal, timeout: DEFAULT_TIMEOUT_MS }, describeTarget(target));
     return { projection: { kind: actionReleaseResultKind(input.kind), target, output: redactRawSecrets(result.stdout.trim()) }, target };
   }
@@ -1586,13 +1559,6 @@ function issueMutationResultKind(kind: IssueKind): string {
   }
 }
 
-function issueEffect(kind: IssueKind, target: ResourceTarget): string {
-  const repository = formatRepositoryTarget(target) ?? "repository";
-  if (kind === "create_issue") return `Create issue in ${repository}`;
-  if (kind === "close_issue") return `Close issue ${repository}#${targetIssueNumber(target)}`;
-  return `${kind.replace("_issue", "")} issue ${repository}#${targetIssueNumber(target)}`;
-}
-
 function targetIssueNumber(target: ResourceTarget): number {
   if (target.kind !== "issue") throw new GhExecutionError("validation", "An issue target is required.");
   return target.number;
@@ -1657,17 +1623,6 @@ function pullRequestMutationResultKind(input: PullRequestRequestInput): string {
     case "update_pull_request_branch": return "pull_request_branch_updated";
     default: return assertNever(input.kind);
   }
-}
-
-function pullRequestEffect(input: PullRequestRequestInput, target: ResourceTarget): string {
-  const repository = formatRepositoryTarget(target) ?? "repository";
-  const number = target.kind === "pull_request" ? `#${target.number}` : "";
-  if (input.kind === "create_pull_request") return `Create pull request in ${repository}`;
-  if (input.kind === "merge_pull_request") return `Merge pull request ${repository}${number} using ${input.method ?? "merge"}`;
-  if (input.kind === "close_pull_request") return `Close pull request ${repository}${number}`;
-  if (input.kind === "update_pull_request_branch") return `Update pull request branch ${repository}${number}`;
-  if (input.kind === "review_pull_request") return `Submit ${input.event ?? "comment"} review for ${repository}${number}`;
-  return `${input.kind.replace("_pull_request", "")} pull request ${repository}${number}`;
 }
 
 function buildPullRequestArgv(input: PullRequestRequestInput, target: ResourceTarget): string[] {
@@ -1793,18 +1748,6 @@ function actionReleaseResultKind(kind: ActionReleaseKind): string {
     delete_release_asset: "release_asset_deleted",
   };
   return names[kind];
-}
-
-function actionReleaseEffect(input: ActionReleaseRequestInput, target: ResourceTarget): string {
-  const repository = formatRepositoryTarget(target) ?? "repository";
-  if (input.kind === "dispatch_workflow") return `Dispatch workflow ${input.workflow ?? ""} on ${repository}`;
-  if (input.kind === "cancel_workflow_run") return `Cancel workflow run ${repository}#${targetRunId(target)}`;
-  if (input.kind === "rerun_workflow_run") return `Rerun workflow run ${repository}#${targetRunId(target)}`;
-  const tag = target.kind === "release" ? target.tag : input.tag ?? "";
-  if (input.kind === "create_release") return `Publish release ${repository}@${input.tag ?? ""}`;
-  if (input.kind === "delete_release") return `Delete release ${repository}@${tag}`;
-  if (input.kind === "delete_release_asset") return `Delete release asset ${repository}@${tag}/${input.asset ?? ""}`;
-  return `${input.kind.replace(/_/g, " ")} ${repository}@${tag}`;
 }
 
 function buildActionReleaseArgv(input: ActionReleaseRequestInput, target: ResourceTarget): string[] {

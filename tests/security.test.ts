@@ -107,7 +107,7 @@ test("merge verification details redact nested escaped credentials", async () =>
     }
     return { stdout: JSON.stringify({ data: { repository: { pullRequest: { number: 1, state: "MERGED" } } } }), stderr: "", code: 0, killed: false };
   });
-  const { tools } = loadExtension({ executor: executor.execute, confirm: async () => true });
+  const { tools } = loadExtension({ executor: executor.execute });
   const tool = tools.get("gh_merge_pull_request");
   assert.ok(tool);
   const result = await tool.execute(

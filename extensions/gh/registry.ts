@@ -2,7 +2,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import type { ViewResourceKind } from "./targets.ts";
 
-export type GuardClass = "read" | "routine" | "guarded";
+export type OperationClass = "read" | "write";
 
 export interface Operation {
   name: string;
@@ -12,7 +12,7 @@ export interface Operation {
   keywords: string[];
   resourceKind: string;
   verb: string;
-  classification: GuardClass;
+  classification: OperationClass;
   parameters: TSchema;
   /** A representative argv shape used by registry contract tests and documentation. */
   argvFixture: readonly string[];
@@ -459,8 +459,8 @@ export const findOperation: Operation = {
   promptSnippet: "Find additional GitHub tools when the active tools are insufficient",
 };
 
-function operationWithClass(
-  classification: GuardClass,
+function operationWithClassification(
+  classification: OperationClass,
   definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
 ): Operation {
   return {
@@ -476,14 +476,13 @@ function operationWithClass(
 function readOperation(
   definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
 ): Operation {
-  return operationWithClass("read", definition);
+  return operationWithClassification("read", definition);
 }
 
 function writeOperation(
-  classification: "routine" | "guarded",
   definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
 ): Operation {
-  return operationWithClass(classification, definition);
+  return operationWithClassification("write", definition);
 }
 
 export const searchOperationKinds = {
@@ -732,7 +731,7 @@ export type IssueOperationName = keyof typeof issueOperationKinds;
 export type IssueKind = (typeof issueOperationKinds)[IssueOperationName];
 
 export const issueOperations: readonly Operation[] = [
-  writeOperation("routine", {
+  writeOperation({
     name: "gh_create_issue",
     label: "Create Issue",
     description: "Create an issue with a title, body, labels, and assignees.",
@@ -744,7 +743,7 @@ export const issueOperations: readonly Operation[] = [
     argvFixture: ["issue", "create", "--repo", "OWNER/REPO", "--title", "Title"],
     buildArgv: () => ["issue", "create", "--repo", "OWNER/REPO", "--title", "Title"],
   }),
-  writeOperation("routine", {
+  writeOperation({
     name: "gh_comment_issue",
     label: "Comment on Issue",
     description: "Add a comment to an issue while preserving the body as data.",
@@ -756,7 +755,7 @@ export const issueOperations: readonly Operation[] = [
     argvFixture: ["issue", "comment", "1", "--repo", "OWNER/REPO", "--body", "text"],
     buildArgv: () => ["issue", "comment", "1", "--repo", "OWNER/REPO", "--body", "text"],
   }),
-  writeOperation("routine", {
+  writeOperation({
     name: "gh_edit_issue",
     label: "Edit Issue",
     description: "Edit issue metadata, including title, body, assignees, labels, and milestone.",
@@ -768,10 +767,10 @@ export const issueOperations: readonly Operation[] = [
     argvFixture: ["issue", "edit", "1", "--repo", "OWNER/REPO"],
     buildArgv: () => ["issue", "edit", "1", "--repo", "OWNER/REPO"],
   }),
-  writeOperation("guarded", {
+  writeOperation({
     name: "gh_close_issue",
     label: "Close Issue",
-    description: "Close an issue after confirming the normalized target and lifecycle effect.",
+    description: "Close an issue using its normalized target.",
     aliases: ["close issue", "resolve issue"],
     keywords: ["issue", "close", "resolve", "lifecycle"],
     resourceKind: "issue",
@@ -780,7 +779,7 @@ export const issueOperations: readonly Operation[] = [
     argvFixture: ["issue", "close", "1", "--repo", "OWNER/REPO"],
     buildArgv: () => ["issue", "close", "1", "--repo", "OWNER/REPO"],
   }),
-  writeOperation("routine", {
+  writeOperation({
     name: "gh_reopen_issue",
     label: "Reopen Issue",
     description: "Reopen an issue using its normalized target.",
@@ -809,14 +808,14 @@ export type PullRequestOperationName = keyof typeof pullRequestOperationKinds;
 export type PullRequestKind = (typeof pullRequestOperationKinds)[PullRequestOperationName];
 
 export const pullRequestOperations: readonly Operation[] = [
-  writeOperation("routine", { name: "gh_create_pull_request", label: "Create Pull Request", description: "Create a pull request with branches, draft state, reviewers, assignees, and labels.", aliases: ["create pull request", "new pull request", "open pull request"], keywords: ["pull", "request", "create", "draft", "reviewers"], resourceKind: "pull request", verb: "create", parameters: createPullRequestParameters, argvFixture: ["pr", "create", "--repo", "OWNER/REPO", "--title", "Title"], buildArgv: () => ["pr", "create", "--repo", "OWNER/REPO"] }),
-  writeOperation("routine", { name: "gh_comment_pull_request", label: "Comment on Pull Request", description: "Add a comment to a pull request while preserving body data.", aliases: ["comment pull request", "pull request comment", "comment pr"], keywords: ["pull", "request", "comment", "reply"], resourceKind: "pull request", verb: "comment", parameters: pullRequestCommentParameters, argvFixture: ["pr", "comment", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "comment", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("routine", { name: "gh_edit_pull_request", label: "Edit Pull Request", description: "Edit pull-request metadata, body, draft state, reviewers, assignees, and labels.", aliases: ["edit pull request", "pull request metadata", "edit pr"], keywords: ["pull", "request", "edit", "draft", "reviewers", "labels"], resourceKind: "pull request", verb: "edit", parameters: editPullRequestParameters, argvFixture: ["pr", "edit", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "edit", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("guarded", { name: "gh_review_pull_request", label: "Review Pull Request", description: "Submit a pull-request review; approval and request-changes effects require confirmation.", aliases: ["review pull request", "review pr", "approve pull request", "request changes"], keywords: ["pull", "request", "review", "approve", "changes", "comment"], resourceKind: "pull request", verb: "review", parameters: reviewPullRequestParameters, argvFixture: ["pr", "review", "1", "--repo", "OWNER/REPO", "--approve"], buildArgv: () => ["pr", "review", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("guarded", { name: "gh_close_pull_request", label: "Close Pull Request", description: "Close a pull request after confirming the normalized target and lifecycle effect.", aliases: ["close pull request", "close pr"], keywords: ["pull", "request", "close", "lifecycle"], resourceKind: "pull request", verb: "close", parameters: issueStateParameters, argvFixture: ["pr", "close", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "close", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("routine", { name: "gh_reopen_pull_request", label: "Reopen Pull Request", description: "Reopen a pull request using its normalized target.", aliases: ["reopen pull request", "reopen pr"], keywords: ["pull", "request", "reopen", "open"], resourceKind: "pull request", verb: "reopen", parameters: issueStateParameters, argvFixture: ["pr", "reopen", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "reopen", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("guarded", { name: "gh_merge_pull_request", label: "Merge Pull Request", description: "Merge a pull request using a confirmed merge method and optional branch deletion.", aliases: ["merge pull request", "merge pr", "squash pull request"], keywords: ["pull", "request", "merge", "squash", "rebase", "branch"], resourceKind: "pull request", verb: "merge", parameters: mergePullRequestParameters, argvFixture: ["pr", "merge", "1", "--repo", "OWNER/REPO", "--squash"], buildArgv: () => ["pr", "merge", "1", "--repo", "OWNER/REPO"] }),
-  writeOperation("guarded", { name: "gh_update_pull_request_branch", label: "Update Pull Request Branch", description: "Update a pull-request branch after confirming the compute effect.", aliases: ["update pull request branch", "update pr branch", "sync pull request"], keywords: ["pull", "request", "branch", "update", "sync", "compute"], resourceKind: "pull request", verb: "update branch", parameters: updatePullRequestBranchParameters, argvFixture: ["pr", "update-branch", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "update-branch", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_create_pull_request", label: "Create Pull Request", description: "Create a pull request with branches, draft state, reviewers, assignees, and labels.", aliases: ["create pull request", "new pull request", "open pull request"], keywords: ["pull", "request", "create", "draft", "reviewers"], resourceKind: "pull request", verb: "create", parameters: createPullRequestParameters, argvFixture: ["pr", "create", "--repo", "OWNER/REPO", "--title", "Title"], buildArgv: () => ["pr", "create", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_comment_pull_request", label: "Comment on Pull Request", description: "Add a comment to a pull request while preserving body data.", aliases: ["comment pull request", "pull request comment", "comment pr"], keywords: ["pull", "request", "comment", "reply"], resourceKind: "pull request", verb: "comment", parameters: pullRequestCommentParameters, argvFixture: ["pr", "comment", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "comment", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_edit_pull_request", label: "Edit Pull Request", description: "Edit pull-request metadata, body, draft state, reviewers, assignees, and labels.", aliases: ["edit pull request", "pull request metadata", "edit pr"], keywords: ["pull", "request", "edit", "draft", "reviewers", "labels"], resourceKind: "pull request", verb: "edit", parameters: editPullRequestParameters, argvFixture: ["pr", "edit", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "edit", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_review_pull_request", label: "Review Pull Request", description: "Submit a pull-request review with an explicit event and optional body.", aliases: ["review pull request", "review pr", "approve pull request", "request changes"], keywords: ["pull", "request", "review", "approve", "changes", "comment"], resourceKind: "pull request", verb: "review", parameters: reviewPullRequestParameters, argvFixture: ["pr", "review", "1", "--repo", "OWNER/REPO", "--approve"], buildArgv: () => ["pr", "review", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_close_pull_request", label: "Close Pull Request", description: "Close a pull request using its normalized target.", aliases: ["close pull request", "close pr"], keywords: ["pull", "request", "close", "lifecycle"], resourceKind: "pull request", verb: "close", parameters: issueStateParameters, argvFixture: ["pr", "close", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "close", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_reopen_pull_request", label: "Reopen Pull Request", description: "Reopen a pull request using its normalized target.", aliases: ["reopen pull request", "reopen pr"], keywords: ["pull", "request", "reopen", "open"], resourceKind: "pull request", verb: "reopen", parameters: issueStateParameters, argvFixture: ["pr", "reopen", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "reopen", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_merge_pull_request", label: "Merge Pull Request", description: "Merge a pull request with an explicit method and optional branch deletion.", aliases: ["merge pull request", "merge pr", "squash pull request"], keywords: ["pull", "request", "merge", "squash", "rebase", "branch"], resourceKind: "pull request", verb: "merge", parameters: mergePullRequestParameters, argvFixture: ["pr", "merge", "1", "--repo", "OWNER/REPO", "--squash"], buildArgv: () => ["pr", "merge", "1", "--repo", "OWNER/REPO"] }),
+  writeOperation({ name: "gh_update_pull_request_branch", label: "Update Pull Request Branch", description: "Update a pull-request branch using its normalized target.", aliases: ["update pull request branch", "update pr branch", "sync pull request"], keywords: ["pull", "request", "branch", "update", "sync", "compute"], resourceKind: "pull request", verb: "update branch", parameters: updatePullRequestBranchParameters, argvFixture: ["pr", "update-branch", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["pr", "update-branch", "1", "--repo", "OWNER/REPO"] }),
 ];
 
 export const actionReleaseOperationKinds = {
@@ -834,14 +833,14 @@ export type ActionReleaseOperationName = keyof typeof actionReleaseOperationKind
 export type ActionReleaseKind = (typeof actionReleaseOperationKinds)[ActionReleaseOperationName];
 
 export const actionReleaseOperations: readonly Operation[] = [
-  writeOperation("guarded", { name: "gh_dispatch_workflow", label: "Dispatch Workflow", description: "Dispatch a workflow on a selected ref with typed inputs after confirmation.", aliases: ["dispatch workflow", "run workflow", "workflow dispatch"], keywords: ["workflow", "dispatch", "ref", "inputs", "compute"], resourceKind: "workflow", verb: "dispatch", parameters: dispatchWorkflowParameters, argvFixture: ["workflow", "run", "build.yml", "--repo", "OWNER/REPO"], buildArgv: () => ["workflow", "run", "build.yml"] }),
-  writeOperation("guarded", { name: "gh_cancel_workflow_run", label: "Cancel Workflow Run", description: "Cancel a workflow run after confirming the compute effect.", aliases: ["cancel workflow run", "cancel run", "stop workflow"], keywords: ["workflow", "run", "cancel", "stop", "compute"], resourceKind: "workflow run", verb: "cancel", parameters: workflowRunWriteParameters, argvFixture: ["run", "cancel", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "cancel", "1"] }),
-  writeOperation("guarded", { name: "gh_rerun_workflow_run", label: "Rerun Workflow Run", description: "Rerun a workflow after confirming the compute effect.", aliases: ["rerun workflow run", "rerun run", "retry workflow"], keywords: ["workflow", "run", "rerun", "retry", "compute"], resourceKind: "workflow run", verb: "rerun", parameters: workflowRunWriteParameters, argvFixture: ["run", "rerun", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "rerun", "1"] }),
-  writeOperation("guarded", { name: "gh_create_release", label: "Create Release", description: "Create and publish a release after confirming the publication effect.", aliases: ["create release", "publish release", "new release"], keywords: ["release", "create", "publish", "tag"], resourceKind: "release", verb: "create", parameters: createReleaseParameters, argvFixture: ["release", "create", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "create", "v1"] }),
-  writeOperation("routine", { name: "gh_edit_release", label: "Edit Release", description: "Edit release metadata without changing publication state.", aliases: ["edit release", "release metadata"], keywords: ["release", "edit", "notes", "draft", "prerelease"], resourceKind: "release", verb: "edit", parameters: editReleaseParameters, argvFixture: ["release", "edit", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "edit", "v1"] }),
-  writeOperation("routine", { name: "gh_upload_release_asset", label: "Upload Release Asset", description: "Upload a validated local file to a release.", aliases: ["upload release asset", "release asset", "upload asset"], keywords: ["release", "asset", "upload", "file"], resourceKind: "release asset", verb: "upload", parameters: uploadReleaseAssetParameters, argvFixture: ["release", "upload", "v1", "asset.zip", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "upload", "v1", "asset.zip"] }),
-  writeOperation("guarded", { name: "gh_delete_release", label: "Delete Release", description: "Delete a release after confirming the deletion effect.", aliases: ["delete release", "remove release"], keywords: ["release", "delete", "remove"], resourceKind: "release", verb: "delete", parameters: deleteReleaseParameters, argvFixture: ["release", "delete", "v1", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete", "v1"] }),
-  writeOperation("guarded", { name: "gh_delete_release_asset", label: "Delete Release Asset", description: "Delete a release asset after confirming the deletion effect.", aliases: ["delete release asset", "delete asset", "remove asset"], keywords: ["release", "asset", "delete", "remove"], resourceKind: "release asset", verb: "delete", parameters: deleteReleaseAssetParameters, argvFixture: ["release", "delete-asset", "asset.zip", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete-asset", "asset.zip"] }),
+  writeOperation({ name: "gh_dispatch_workflow", label: "Dispatch Workflow", description: "Dispatch a workflow on a selected ref with typed inputs.", aliases: ["dispatch workflow", "run workflow", "workflow dispatch"], keywords: ["workflow", "dispatch", "ref", "inputs", "compute"], resourceKind: "workflow", verb: "dispatch", parameters: dispatchWorkflowParameters, argvFixture: ["workflow", "run", "build.yml", "--repo", "OWNER/REPO"], buildArgv: () => ["workflow", "run", "build.yml"] }),
+  writeOperation({ name: "gh_cancel_workflow_run", label: "Cancel Workflow Run", description: "Cancel a workflow run using its normalized target.", aliases: ["cancel workflow run", "cancel run", "stop workflow"], keywords: ["workflow", "run", "cancel", "stop", "compute"], resourceKind: "workflow run", verb: "cancel", parameters: workflowRunWriteParameters, argvFixture: ["run", "cancel", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "cancel", "1"] }),
+  writeOperation({ name: "gh_rerun_workflow_run", label: "Rerun Workflow Run", description: "Rerun a workflow using its normalized target.", aliases: ["rerun workflow run", "rerun run", "retry workflow"], keywords: ["workflow", "run", "rerun", "retry", "compute"], resourceKind: "workflow run", verb: "rerun", parameters: workflowRunWriteParameters, argvFixture: ["run", "rerun", "1", "--repo", "OWNER/REPO"], buildArgv: () => ["run", "rerun", "1"] }),
+  writeOperation({ name: "gh_create_release", label: "Create Release", description: "Create and publish a release with an explicit tag.", aliases: ["create release", "publish release", "new release"], keywords: ["release", "create", "publish", "tag"], resourceKind: "release", verb: "create", parameters: createReleaseParameters, argvFixture: ["release", "create", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "create", "v1"] }),
+  writeOperation({ name: "gh_edit_release", label: "Edit Release", description: "Edit release metadata without changing publication state.", aliases: ["edit release", "release metadata"], keywords: ["release", "edit", "notes", "draft", "prerelease"], resourceKind: "release", verb: "edit", parameters: editReleaseParameters, argvFixture: ["release", "edit", "v1", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "edit", "v1"] }),
+  writeOperation({ name: "gh_upload_release_asset", label: "Upload Release Asset", description: "Upload a validated local file to a release.", aliases: ["upload release asset", "release asset", "upload asset"], keywords: ["release", "asset", "upload", "file"], resourceKind: "release asset", verb: "upload", parameters: uploadReleaseAssetParameters, argvFixture: ["release", "upload", "v1", "asset.zip", "--repo", "OWNER/REPO"], buildArgv: () => ["release", "upload", "v1", "asset.zip"] }),
+  writeOperation({ name: "gh_delete_release", label: "Delete Release", description: "Delete a release using its normalized target.", aliases: ["delete release", "remove release"], keywords: ["release", "delete", "remove"], resourceKind: "release", verb: "delete", parameters: deleteReleaseParameters, argvFixture: ["release", "delete", "v1", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete", "v1"] }),
+  writeOperation({ name: "gh_delete_release_asset", label: "Delete Release Asset", description: "Delete a release asset using its normalized target and name.", aliases: ["delete release asset", "delete asset", "remove asset"], keywords: ["release", "asset", "delete", "remove"], resourceKind: "release asset", verb: "delete", parameters: deleteReleaseAssetParameters, argvFixture: ["release", "delete-asset", "asset.zip", "--repo", "OWNER/REPO", "--yes"], buildArgv: () => ["release", "delete-asset", "asset.zip"] }),
 ];
 
 export interface OperationRegistry {

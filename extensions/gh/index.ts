@@ -89,7 +89,6 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
     const pipeline = createPipeline({
       executor,
       tempOutput: overrides.tempOutput,
-      confirm: overrides.confirm,
     });
     const registry = suppliedRegistry ?? createRegistry();
 
@@ -363,7 +362,6 @@ function registerIssueTool(pi: ExtensionAPI, operation: Operation, pipeline: Ret
     parameters: schema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const values = params as Record<string, unknown>;
-      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
       const input: IssueRequestInput = {
         kind,
         repo: typeof values.repo === "string" ? values.repo : undefined,
@@ -374,12 +372,7 @@ function registerIssueTool(pi: ExtensionAPI, operation: Operation, pipeline: Ret
         labels: Array.isArray(values.labels) ? values.labels.filter((value): value is string => typeof value === "string") : undefined,
         milestone: typeof values.milestone === "string" ? values.milestone : undefined,
       };
-      const { projection, target } = await pipeline.runIssueWrite(input, {
-        cwd: ctx.cwd,
-        signal,
-        hasUI: ctx.hasUI,
-        confirm: extensionContext.ui?.confirm,
-      });
+      const { projection, target } = await pipeline.runIssueWrite(input, { cwd: ctx.cwd, signal });
       return {
         content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }],
         details: { kind, target: redactModelOutput(target) },
@@ -425,8 +418,7 @@ function registerPullRequestTool(pi: ExtensionAPI, operation: Operation, pipelin
         method: values.method === "merge" || values.method === "squash" || values.method === "rebase" ? values.method : undefined,
         deleteBranch: typeof values.deleteBranch === "boolean" ? values.deleteBranch : undefined,
       };
-      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
-      const { projection, target } = await pipeline.runPullRequestWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
+      const { projection, target } = await pipeline.runPullRequestWrite(input, { cwd: ctx.cwd, signal });
       return { content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }], details: { kind, target: redactModelOutput(target) } };
     },
   });
@@ -469,8 +461,7 @@ function registerActionReleaseTool(pi: ExtensionAPI, operation: Operation, pipel
         label: typeof values.label === "string" ? values.label : undefined,
         asset: typeof values.asset === "string" ? values.asset : undefined,
       };
-      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
-      const { projection, target } = await pipeline.runActionReleaseWrite(input, { cwd: ctx.cwd, signal, hasUI: ctx.hasUI, confirm: extensionContext.ui?.confirm });
+      const { projection, target } = await pipeline.runActionReleaseWrite(input, { cwd: ctx.cwd, signal });
       return { content: [{ type: "text", text: JSON.stringify(redactModelOutput(projection)) }], details: { kind, target: redactModelOutput(target) } };
     },
   });
