@@ -54,11 +54,11 @@ npm run smoke:gh
 
 `verify` runs strict typechecking, the offline suite, and the package dry-run. `smoke:gh` reports the detected CLI version and authenticated host names without displaying credentials.
 
-The credential-gated live evaluation accepts a capture result from an external model harness:
+The credential-gated live evaluation runs prompts through pi in JSON event mode. It uses a fake `gh` executable so model tool calls are captured without changing GitHub:
 
 ```bash
 PI_GH_LIVE_EVAL_RESULT=./evaluation.json \
-  npm run eval:live -- --provider=openai-codex --model=gpt-5.6-sol
+  npm run eval:live -- --provider openai-codex --model gpt-5.6-sol
 npm run eval:report -- ./evaluation.json
 ```
 

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "repository URL view",
+    "prompt": "Inspect https://github.com/cli/cli with GitHub tools. Do not use shell tools.",
+    "tools": ["gh_view"],
+    "args": {"target": "https://github.com/cli/cli"}
+  },
+  {
+    "name": "focused issue search",
+    "prompt": "Find GitHub issue tools, then search issues in cli/cli for authentication.",
+    "tools": ["gh_find", "gh_search_issues"],
+    "args": {"repo": "cli/cli"}
+  },
+  {
+    "name": "uncommon REST read",
+    "prompt": "Find the uncommon REST API read tool, then GET repos/cli/cli/issues with state=open. Do not mutate anything.",
+    "tools": ["gh_find", "gh_api_get"],
+    "args": {"endpoint": "repos/cli/cli/issues"}
+  },
+  {
+    "name": "guarded close",
+    "prompt": "Find the exact issue close operation for cli/cli issue 1, but do not execute it until confirmation.",
+    "tools": ["gh_find", "gh_close_issue"],
+    "args": {"target": "cli/cli#1"}
+  }
+]

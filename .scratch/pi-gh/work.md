@@ -157,7 +157,7 @@
   - [ ] `pi -e . -p 'Inspect https://github.com/cli/cli using the GitHub extension and respond with only the repository name.'` completes through `gh_view` with the package loaded from its root.
   - [ ] CI runs `npm ci` and `npm run verify` on Node 24; a separately gated job can run the live model suite when credentials and the release flag are present.
 - **Status:** ready
-- **Resolutions:** Offline verification, package dry-run, CI, smoke-check, and credential-gated evaluation/report entrypoints are implemented. Final release approval remains gated on an externally supplied live model capture; no model credentials or live capture were available in this session.
+- **Resolutions:** Offline verification, package dry-run, CI, smoke-check, and a credential-gated live evaluation through pi JSON event mode are implemented. The live runner uses a fake gh executable to capture model tool calls without mutating GitHub; final approval still requires provider credentials.
 
 ## Cost and dependency summary
 
