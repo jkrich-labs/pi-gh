@@ -128,6 +128,56 @@ export const pullRequestDiffParameters = Type.Object(
   { additionalProperties: false },
 );
 
+export const listWorkflowRunsParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    workflow: Type.Optional(Type.String({ description: "Workflow name or identifier" })),
+    branch: Type.Optional(Type.String({ description: "Branch filter" })),
+    status: Type.Optional(Type.String({ description: "Run status filter" })),
+    conclusion: Type.Optional(Type.String({ description: "Run conclusion filter" })),
+    limit: Type.Optional(Type.Integer({ description: "Maximum runs", minimum: 1, maximum: 50, default: 20 })),
+    page: Type.Optional(Type.Integer({ description: "Result page, capped at 10", minimum: 1, maximum: 10, default: 1 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const workflowRunParameters = Type.Object(
+  {
+    target: Type.String({ description: "Workflow-run URL" }),
+    attempt: Type.Optional(Type.Integer({ description: "Workflow attempt number", minimum: 1, maximum: 100 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const jobParameters = Type.Object(
+  {
+    target: Type.String({ description: "Workflow-job URL" }),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const checksParameters = Type.Object(
+  {
+    target: Type.String({ description: "Pull-request URL or owner/repo#number" }),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
+export const failedLogsParameters = Type.Object(
+  {
+    target: Type.String({ description: "Workflow-run or job URL" }),
+    step: Type.Optional(Type.String({ description: "Failed step name to select" })),
+    maxLines: Type.Optional(Type.Integer({ description: "Maximum log lines", minimum: 1, maximum: 10000, default: 500 })),
+    maxBytes: Type.Optional(Type.Integer({ description: "Maximum log bytes", minimum: 1, maximum: 1000000, default: 100000 })),
+    detail: Type.Optional(detailParameter()),
+  },
+  { additionalProperties: false },
+);
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -324,6 +374,80 @@ export const contentOperations: readonly Operation[] = [
   }),
 ];
 
+export const ciOperationKinds = {
+  gh_list_workflow_runs: "list_runs",
+  gh_view_workflow_run: "view_run",
+  gh_view_job: "view_job",
+  gh_pr_checks: "pr_checks",
+  gh_failed_logs: "failed_logs",
+} as const;
+
+export type CiOperationName = keyof typeof ciOperationKinds;
+export type CiKind = (typeof ciOperationKinds)[CiOperationName];
+
+export const ciOperations: readonly Operation[] = [
+  readOperation({
+    name: "gh_list_workflow_runs",
+    label: "List Workflow Runs",
+    description: "List bounded workflow runs for a repository with filters and conclusions.",
+    aliases: ["list workflow runs", "workflow runs", "actions runs", "ci runs"],
+    keywords: ["workflow", "run", "runs", "actions", "ci", "builds"],
+    resourceKind: "workflow run",
+    verb: "list",
+    parameters: listWorkflowRunsParameters,
+    argvFixture: ["api", "repos/OWNER/REPO/actions/runs", "--method", "GET"],
+    buildArgv: () => ["api", "repos/OWNER/REPO/actions/runs", "--method", "GET"],
+  }),
+  readOperation({
+    name: "gh_view_workflow_run",
+    label: "View Workflow Run",
+    description: "Inspect one workflow run, including a selected attempt and conclusion.",
+    aliases: ["view workflow run", "workflow run details", "run details"],
+    keywords: ["workflow", "run", "attempt", "status", "conclusion"],
+    resourceKind: "workflow run",
+    verb: "view",
+    parameters: workflowRunParameters,
+    argvFixture: ["run", "view", "1", "--json"],
+    buildArgv: () => ["run", "view", "1", "--json"],
+  }),
+  readOperation({
+    name: "gh_view_job",
+    label: "View Workflow Job",
+    description: "Inspect a workflow job and its step conclusions.",
+    aliases: ["view job", "workflow job", "job details"],
+    keywords: ["job", "workflow", "step", "steps", "conclusion"],
+    resourceKind: "job",
+    verb: "view",
+    parameters: jobParameters,
+    argvFixture: ["run", "view", "1", "--job", "2", "--json"],
+    buildArgv: () => ["run", "view", "1", "--job", "2", "--json"],
+  }),
+  readOperation({
+    name: "gh_pr_checks",
+    label: "Pull Request Checks",
+    description: "View pull-request checks with success, failure, and pending conclusions.",
+    aliases: ["pull request checks", "pr checks", "checks", "status checks"],
+    keywords: ["pull", "request", "pr", "checks", "pending", "failure", "success"],
+    resourceKind: "pull request",
+    verb: "checks",
+    parameters: checksParameters,
+    argvFixture: ["pr", "checks", "1", "--json"],
+    buildArgv: () => ["pr", "checks", "1", "--json"],
+  }),
+  readOperation({
+    name: "gh_failed_logs",
+    label: "Failed Workflow Logs",
+    description: "Retrieve bounded failed workflow logs and select a named failed step.",
+    aliases: ["failed logs", "workflow logs", "ci logs", "failure logs"],
+    keywords: ["logs", "failed", "failure", "step", "diagnose", "debug"],
+    resourceKind: "workflow logs",
+    verb: "read",
+    parameters: failedLogsParameters,
+    argvFixture: ["run", "view", "1", "--log-failed"],
+    buildArgv: () => ["run", "view", "1", "--log-failed"],
+  }),
+];
+
 export interface OperationRegistry {
   readonly operations: readonly Operation[];
   get(name: string): Operation | undefined;
@@ -332,7 +456,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {
@@ -376,7 +500,7 @@ function scoreOperation(operation: Operation, terms: string[]): number {
   const resource = operation.resourceKind.toLowerCase();
   const verb = operation.verb.toLowerCase();
   const description = `${operation.label} ${operation.description}`.toLowerCase();
-  let score = 0;
+  let score = aliases.some((alias) => alias.replace(/[^a-z0-9]+/g, " ").trim() === terms.join(" ")) ? 300 : 0;
 
   for (const term of terms) {
     if (name === term || name.replace(/^gh_/, "") === term) score += 100;

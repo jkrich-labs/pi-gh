@@ -7,15 +7,22 @@ import {
   type SearchRequestInput,
 } from "./execute.ts";
 import {
+  checksParameters,
+  ciOperationKinds,
   createRegistry,
+  failedLogsParameters,
   findParameters,
+  jobParameters,
   listDirectoryParameters,
   pullRequestDiffParameters,
   pullRequestFilesParameters,
   readFileParameters,
   searchParameters,
+  listWorkflowRunsParameters,
+  workflowRunParameters,
   searchOperationKinds,
   type Operation,
+  type CiKind,
   type OperationRegistry,
   type SearchKind,
   viewParameters,
@@ -57,6 +64,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerSearchTool(pi, operation, pipeline, searchOperationKinds[operation.name as keyof typeof searchOperationKinds]);
       } else if (isContentOperation(operation.name)) {
         registerContentTool(pi, operation, pipeline);
+      } else if (operation.name in ciOperationKinds) {
+        registerCiTool(pi, operation, pipeline, ciOperationKinds[operation.name as keyof typeof ciOperationKinds]);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -206,6 +215,48 @@ function registerContentTool(pi: ExtensionAPI, operation: Operation, pipeline: R
 
 function isContentOperation(name: string): boolean {
   return name === "gh_read_file" || name === "gh_list_directory" || name === "gh_pr_files" || name === "gh_pr_diff";
+}
+
+function registerCiTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>, kind: CiKind): void {
+  const schema = operation.name === "gh_list_workflow_runs"
+    ? listWorkflowRunsParameters
+    : operation.name === "gh_view_workflow_run"
+      ? workflowRunParameters
+      : operation.name === "gh_view_job"
+        ? jobParameters
+        : operation.name === "gh_pr_checks"
+          ? checksParameters
+          : failedLogsParameters;
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const input = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        workflow: typeof values.workflow === "string" ? values.workflow : undefined,
+        branch: typeof values.branch === "string" ? values.branch : undefined,
+        status: typeof values.status === "string" ? values.status : undefined,
+        conclusion: typeof values.conclusion === "string" ? values.conclusion : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        attempt: typeof values.attempt === "number" ? values.attempt : undefined,
+        step: typeof values.step === "string" ? values.step : undefined,
+        maxLines: typeof values.maxLines === "number" ? values.maxLines : undefined,
+        maxBytes: typeof values.maxBytes === "number" ? values.maxBytes : undefined,
+        limit: typeof values.limit === "number" ? values.limit : undefined,
+        page: typeof values.page === "number" ? values.page : undefined,
+        detail: values.detail === "expanded" ? "expanded" as const : "compact" as const,
+      };
+      const { projection, target } = await pipeline.runCi(input, { cwd: ctx.cwd, signal });
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection) }],
+        details: { kind, target },
+      };
+    },
+  });
 }
 
 function registerUnimplementedTool(pi: ExtensionAPI, operation: Operation): void {

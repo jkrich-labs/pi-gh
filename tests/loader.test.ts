@@ -30,10 +30,10 @@ test("gh_find repeat calls are stable and reload does not duplicate active tools
   const tool = loaded.tools.get("gh_find");
   assert.ok(tool);
 
-  const first = projectionOf(await tool.execute("find-1", { query: "gh_view" }, undefined, undefined, toolCtx() as never)) as {
+  const first = projectionOf(await tool.execute("find-1", { query: "gh_view", limit: 1 }, undefined, undefined, toolCtx() as never)) as {
     activated: string[];
   };
-  const second = projectionOf(await tool.execute("find-2", { query: "gh_view" }, undefined, undefined, toolCtx() as never)) as {
+  const second = projectionOf(await tool.execute("find-2", { query: "gh_view", limit: 1 }, undefined, undefined, toolCtx() as never)) as {
     activated: string[];
   };
   assert.deepEqual(first.activated, []);
@@ -55,6 +55,26 @@ test("gh_find loads exact search and content tools for representative tasks", as
     ["list directory", "gh_list_directory"],
     ["pull request files", "gh_pr_files"],
     ["pull request diff", "gh_pr_diff"],
+  ] as const;
+  for (const [query, expected] of cases) {
+    const projection = projectionOf(await tool.execute(query, { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as {
+      matches: Array<{ name: string }>;
+    };
+    assert.equal(projection.matches[0]?.name, expected);
+    assert.equal(loaded.activeTools.includes(expected), true);
+  }
+});
+
+test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const cases = [
+    ["workflow runs", "gh_list_workflow_runs"],
+    ["view workflow run", "gh_view_workflow_run"],
+    ["view job", "gh_view_job"],
+    ["pull request checks", "gh_pr_checks"],
+    ["failed logs", "gh_failed_logs"],
   ] as const;
   for (const [query, expected] of cases) {
     const projection = projectionOf(await tool.execute(query, { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as {

@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { SearchKind } from "./registry.ts";
+import type { CiKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -23,6 +23,9 @@ export const DEFAULT_SEARCH_LIMIT = 10;
 export const MAX_SEARCH_LIMIT = 50;
 export const MAX_SEARCH_PAGE = 10;
 export const DEFAULT_PR_FILES_LIMIT = 30;
+export const DEFAULT_WORKFLOW_RUN_LIMIT = 20;
+export const MAX_LOG_LINES = 10_000;
+export const MAX_LOG_BYTES = 1_000_000;
 export const REPO_VIEW_FIELDS =
   "name,nameWithOwner,description,url,visibility,isPrivate,isFork,isArchived,stargazerCount,forkCount,primaryLanguage,defaultBranchRef,updatedAt,createdAt,homepageUrl,licenseInfo,repositoryTopics,owner";
 
@@ -49,6 +52,23 @@ export interface ContentRequestInput {
   path?: string;
   ref?: string;
   target?: string;
+  limit?: number;
+  page?: number;
+  detail?: "compact" | "expanded";
+}
+
+export interface CiRequestInput {
+  kind: CiKind;
+  repo?: string;
+  workflow?: string;
+  branch?: string;
+  status?: string;
+  conclusion?: string;
+  target?: string;
+  attempt?: number;
+  step?: string;
+  maxLines?: number;
+  maxBytes?: number;
   limit?: number;
   page?: number;
   detail?: "compact" | "expanded";
@@ -297,7 +317,61 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     };
   }
 
-  return { runView, runSearch, runContent, ensureHost };
+  async function runCi(
+    input: CiRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<{ projection: Record<string, unknown>; target?: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    let target: ResourceTarget | undefined;
+    if (input.kind === "list_runs") {
+      if (!input.repo) throw new GhExecutionError("validation", "A repository target is required.");
+      target = resolveRepositoryTarget(input.repo);
+    } else if (input.kind === "view_run") {
+      if (!input.target) throw new GhExecutionError("validation", "A workflow-run target is required.");
+      target = resolveResourceTarget(input.target, { kind: "workflow_run" });
+    } else if (input.kind === "view_job") {
+      if (!input.target) throw new GhExecutionError("validation", "A job target is required.");
+      target = resolveResourceTarget(input.target, { kind: "job" });
+    } else if (input.kind === "pr_checks") {
+      if (!input.target) throw new GhExecutionError("validation", "A pull-request target is required.");
+      target = resolveResourceTarget(input.target, { kind: "pull_request" });
+    } else {
+      if (!input.target) throw new GhExecutionError("validation", "A workflow-run or job target is required.");
+      target = resolveResourceTarget(input.target);
+      if (target.kind !== "workflow_run" && target.kind !== "job") {
+        throw new GhExecutionError("validation", "Failed logs require a workflow-run or job target.");
+      }
+    }
+    if (target.kind === "current_checkout") throw new GhExecutionError("validation", "An explicit GitHub resource target is required.");
+    await ensureGh(ctx.signal);
+    await ensureHost(target.host, ctx.signal);
+    const limit = clamp(input.limit, DEFAULT_WORKFLOW_RUN_LIMIT, 1, MAX_SEARCH_LIMIT);
+    const page = clamp(input.page, 1, 1, MAX_SEARCH_PAGE);
+    const result = await run({
+      argv: buildCiArgv(input, target, limit, page),
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: DEFAULT_TIMEOUT_MS,
+    });
+    let projection: Record<string, unknown>;
+    if (input.kind === "failed_logs") {
+      projection = projectFailedLogs(result.stdout, target, input.step, clamp(input.maxLines, 500, 1, MAX_LOG_LINES), clamp(input.maxBytes, 100_000, 1, MAX_LOG_BYTES));
+    } else {
+      const decoded = decodeJson(result);
+      projection = projectCi(decoded, input.kind, target, page, limit);
+    }
+    return {
+      projection: await budgetProjection(
+        projection,
+        input.detail === "expanded" ? EXPANDED_TOKEN_BUDGET : DEFAULT_TOKEN_BUDGET,
+        tempOutput,
+        ciSummaryKeys(input.kind),
+      ),
+      target,
+    };
+  }
+
+  return { runView, runSearch, runContent, runCi, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -593,6 +667,140 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 function clamp(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
   const numeric = Number.isFinite(value) ? Math.trunc(value!) : fallback;
   return Math.max(minimum, Math.min(maximum, numeric));
+}
+
+function buildCiArgv(input: CiRequestInput, target: ResourceTarget, limit: number, page: number): string[] {
+  const repository = formatRepositoryTarget(target)!;
+  const cliRepository = cliRepositoryTarget(target);
+  switch (input.kind) {
+    case "list_runs":
+      return [
+        "api",
+        ...hostnameArgs(target),
+        `repos/${repository}/actions/runs`,
+        "--method",
+        "GET",
+        ...(input.workflow ? ["--field", `workflow_id=${input.workflow}`] : []),
+        ...(input.branch ? ["--field", `branch=${input.branch}`] : []),
+        ...(input.status ? ["--field", `status=${input.status}`] : []),
+        ...(input.conclusion ? ["--field", `conclusion=${input.conclusion}`] : []),
+        "--field",
+        `per_page=${limit}`,
+        "--field",
+        `page=${page}`,
+      ];
+    case "view_run":
+      return ["run", "view", String(targetNumberForKind(target, "workflow_run")), "--repo", cliRepository, ...(input.attempt ? ["--attempt", String(input.attempt)] : []), "--json", RUN_VIEW_FIELDS];
+    case "view_job":
+      return ["run", "view", String(targetNumberForKind(target, "job_run")), "--job", String(targetJobId(target)), "--repo", cliRepository, "--json", JOB_VIEW_FIELDS];
+    case "pr_checks":
+      return ["pr", "checks", String(targetNumberForKind(target, "pull_request")), "--repo", cliRepository, "--json", "name,state,bucket,link,workflow" ];
+    case "failed_logs":
+      return ["run", "view", String(targetRunId(target)), ...(target.kind === "job" ? ["--job", String(target.jobId)] : []), "--repo", cliRepository, "--log-failed"];
+    default:
+      return assertNever(input.kind);
+  }
+}
+
+function projectCi(raw: unknown, kind: Exclude<CiKind, "failed_logs">, target: ResourceTarget, page: number, limit: number): Record<string, unknown> {
+  if (kind === "list_runs") {
+    if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub workflow-runs JSON was not an object.");
+    const value = raw as Record<string, unknown>;
+    const runs = Array.isArray(value.workflow_runs) ? value.workflow_runs.slice(0, limit).map(compactWorkflowRun) : [];
+    return { kind: "workflow_runs", target, page, limit, totalCount: asNumber(value.total_count), runCount: runs.length, runs };
+  }
+  if (kind === "pr_checks") {
+    if (!Array.isArray(raw)) throw new GhExecutionError("malformed_json", "GitHub checks JSON was not an array.");
+    const checks = raw.map((entry) => redactUnknown(entry));
+    return { kind: "pull_request_checks", target, checkCount: checks.length, checks };
+  }
+  if (!raw || typeof raw !== "object") throw new GhExecutionError("malformed_json", "GitHub CI JSON was not an object.");
+  return { kind: kind === "view_job" ? "job" : "workflow_run", target, ...redactUnknown(raw) as Record<string, unknown> };
+}
+
+function compactWorkflowRun(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { value: raw };
+  const value = raw as Record<string, unknown>;
+  const keys = ["databaseId", "id", "name", "workflowName", "displayTitle", "status", "conclusion", "event", "headBranch", "headSha", "attempt", "createdAt", "updatedAt", "url", "html_url"];
+  return Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, redactUnknown(value[key])]));
+}
+
+function projectFailedLogs(raw: string, target: ResourceTarget, requestedStep: string | undefined, maxLines: number, maxBytes: number): Record<string, unknown> {
+  const lines = raw.split(/\r?\n/).filter((line, index, all) => !(index === all.length - 1 && line === ""));
+  const sections: Array<{ name: string; lines: string[] }> = [];
+  let current: { name: string; lines: string[] } | undefined;
+  for (const line of lines) {
+    const heading = /^(.*?)\s*\/\s*(.*?)\s*$/.exec(line);
+    if (heading) {
+      current = { name: heading[2]!.trim(), lines: [] };
+      sections.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  let selected: string[];
+  let step: string;
+  let partial = false;
+  if (requestedStep) {
+    const match = sections.find((section) => section.name.toLowerCase().includes(requestedStep.toLowerCase()));
+    if (!match) return { kind: "failed_logs", target, step: "UNKNOWN STEP", log: "", lineCount: 0, byteCount: 0, partial: true };
+    selected = match.lines;
+    step = match.name;
+  } else {
+    selected = lines;
+    step = sections[0]?.name ?? "FAILED STEPS";
+  }
+  if (selected.length > maxLines) {
+    selected = selected.slice(0, maxLines);
+    partial = true;
+  }
+  const bounded: string[] = [];
+  let bytes = 0;
+  for (const line of selected) {
+    const lineBytes = Buffer.byteLength(line + (bounded.length > 0 ? "\n" : ""));
+    if (bytes + lineBytes > maxBytes) {
+      partial = true;
+      break;
+    }
+    bounded.push(line);
+    bytes += lineBytes;
+  }
+  const log = bounded.join("\n");
+  if (bounded.length < selected.length) partial = true;
+  return { kind: "failed_logs", target, step, log, lineCount: bounded.length, byteCount: Buffer.byteLength(log), partial };
+}
+
+function ciSummaryKeys(kind: CiKind): readonly string[] {
+  switch (kind) {
+    case "list_runs":
+      return ["target", "page", "limit", "totalCount", "runCount"];
+    case "pr_checks":
+      return ["target", "checkCount"];
+    case "failed_logs":
+      return ["target", "step", "lineCount", "byteCount", "partial"];
+    case "view_run":
+    case "view_job":
+      return ["target", "status", "conclusion", "databaseId", "attempt"];
+    default:
+      return [];
+  }
+}
+
+function targetNumberForKind(target: ResourceTarget, kind: "workflow_run" | "job_run" | "pull_request"): number {
+  if (kind === "workflow_run" && target.kind === "workflow_run") return target.runId;
+  if (kind === "job_run" && target.kind === "job") return target.runId;
+  if (kind === "pull_request" && target.kind === "pull_request") return target.number;
+  throw new GhExecutionError("validation", "The resource target kind does not match the CI operation.");
+}
+
+function targetJobId(target: ResourceTarget): number {
+  if (target.kind !== "job") throw new GhExecutionError("validation", "A job target is required.");
+  return target.jobId;
+}
+
+function targetRunId(target: ResourceTarget): number {
+  if (target.kind === "job" || target.kind === "workflow_run") return target.kind === "job" ? target.runId : target.runId;
+  throw new GhExecutionError("validation", "A workflow-run or job target is required.");
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {
