@@ -178,6 +178,45 @@ export const failedLogsParameters = Type.Object(
   { additionalProperties: false },
 );
 
+const stringArrayParameter = (description: string) => Type.Optional(Type.Array(Type.String(), { description, maxItems: 20 }));
+
+export const createIssueParameters = Type.Object(
+  {
+    repo: Type.String({ description: "Repository URL or owner/repo" }),
+    title: Type.String({ description: "Issue title" }),
+    body: Type.Optional(Type.String({ description: "Issue body" })),
+    assignees: stringArrayParameter("Users to assign"),
+    labels: stringArrayParameter("Labels to add"),
+    milestone: Type.Optional(Type.String({ description: "Milestone name" })),
+  },
+  { additionalProperties: false },
+);
+
+export const issueCommentParameters = Type.Object(
+  {
+    target: Type.String({ description: "Issue URL or owner/repo#number" }),
+    body: Type.String({ description: "Comment body" }),
+  },
+  { additionalProperties: false },
+);
+
+export const editIssueParameters = Type.Object(
+  {
+    target: Type.String({ description: "Issue URL or owner/repo#number" }),
+    title: Type.Optional(Type.String({ description: "Replacement issue title" })),
+    body: Type.Optional(Type.String({ description: "Replacement issue body" })),
+    assignees: stringArrayParameter("Users to assign"),
+    labels: stringArrayParameter("Labels to add"),
+    milestone: Type.Optional(Type.String({ description: "Milestone name" })),
+  },
+  { additionalProperties: false },
+);
+
+export const issueStateParameters = Type.Object(
+  { target: Type.String({ description: "Issue URL or owner/repo#number" }) },
+  { additionalProperties: false },
+);
+
 function identity(value: unknown): unknown {
   return value;
 }
@@ -236,17 +275,31 @@ export const findOperation: Operation = {
   promptSnippet: "Find additional GitHub tools when the active tools are insufficient",
 };
 
-function readOperation(
+function operationWithClass(
+  classification: GuardClass,
   definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
 ): Operation {
   return {
     ...definition,
-    classification: "read",
+    classification,
     decoderFixture: identity,
     projectorFixture: identity,
     decode: identity,
     project: identity,
   };
+}
+
+function readOperation(
+  definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
+): Operation {
+  return operationWithClass("read", definition);
+}
+
+function writeOperation(
+  classification: "routine" | "guarded",
+  definition: Omit<Operation, "classification" | "decoderFixture" | "projectorFixture" | "decode" | "project">,
+): Operation {
+  return operationWithClass(classification, definition);
 }
 
 export const searchOperationKinds = {
@@ -448,6 +501,80 @@ export const ciOperations: readonly Operation[] = [
   }),
 ];
 
+export const issueOperationKinds = {
+  gh_create_issue: "create_issue",
+  gh_comment_issue: "comment_issue",
+  gh_edit_issue: "edit_issue",
+  gh_close_issue: "close_issue",
+  gh_reopen_issue: "reopen_issue",
+} as const;
+
+export type IssueOperationName = keyof typeof issueOperationKinds;
+export type IssueKind = (typeof issueOperationKinds)[IssueOperationName];
+
+export const issueOperations: readonly Operation[] = [
+  writeOperation("routine", {
+    name: "gh_create_issue",
+    label: "Create Issue",
+    description: "Create an issue with a title, body, labels, and assignees.",
+    aliases: ["create issue", "new issue", "open issue"],
+    keywords: ["issue", "create", "new", "title", "body", "labels", "assignees"],
+    resourceKind: "issue",
+    verb: "create",
+    parameters: createIssueParameters,
+    argvFixture: ["issue", "create", "--repo", "OWNER/REPO", "--title", "Title"],
+    buildArgv: () => ["issue", "create", "--repo", "OWNER/REPO", "--title", "Title"],
+  }),
+  writeOperation("routine", {
+    name: "gh_comment_issue",
+    label: "Comment on Issue",
+    description: "Add a comment to an issue while preserving the body as data.",
+    aliases: ["comment on issue", "issue comment", "comment issue"],
+    keywords: ["issue", "comment", "reply", "body"],
+    resourceKind: "issue",
+    verb: "comment",
+    parameters: issueCommentParameters,
+    argvFixture: ["issue", "comment", "1", "--repo", "OWNER/REPO", "--body", "text"],
+    buildArgv: () => ["issue", "comment", "1", "--repo", "OWNER/REPO", "--body", "text"],
+  }),
+  writeOperation("routine", {
+    name: "gh_edit_issue",
+    label: "Edit Issue",
+    description: "Edit issue metadata, including title, body, assignees, labels, and milestone.",
+    aliases: ["edit issue", "assign issue", "label issue", "issue metadata"],
+    keywords: ["issue", "edit", "assign", "assignee", "label", "labels", "milestone"],
+    resourceKind: "issue",
+    verb: "edit",
+    parameters: editIssueParameters,
+    argvFixture: ["issue", "edit", "1", "--repo", "OWNER/REPO"],
+    buildArgv: () => ["issue", "edit", "1", "--repo", "OWNER/REPO"],
+  }),
+  writeOperation("guarded", {
+    name: "gh_close_issue",
+    label: "Close Issue",
+    description: "Close an issue after confirming the normalized target and lifecycle effect.",
+    aliases: ["close issue", "resolve issue"],
+    keywords: ["issue", "close", "resolve", "lifecycle"],
+    resourceKind: "issue",
+    verb: "close",
+    parameters: issueStateParameters,
+    argvFixture: ["issue", "close", "1", "--repo", "OWNER/REPO"],
+    buildArgv: () => ["issue", "close", "1", "--repo", "OWNER/REPO"],
+  }),
+  writeOperation("routine", {
+    name: "gh_reopen_issue",
+    label: "Reopen Issue",
+    description: "Reopen an issue using its normalized target.",
+    aliases: ["reopen issue", "open issue again"],
+    keywords: ["issue", "reopen", "open", "lifecycle"],
+    resourceKind: "issue",
+    verb: "reopen",
+    parameters: issueStateParameters,
+    argvFixture: ["issue", "reopen", "1", "--repo", "OWNER/REPO"],
+    buildArgv: () => ["issue", "reopen", "1", "--repo", "OWNER/REPO"],
+  }),
+];
+
 export interface OperationRegistry {
   readonly operations: readonly Operation[];
   get(name: string): Operation | undefined;
@@ -456,7 +583,7 @@ export interface OperationRegistry {
 }
 
 export function createRegistry(additional: readonly Operation[] = []): OperationRegistry {
-  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...additional];
+  const operations = [viewOperation, findOperation, ...searchOperations, ...contentOperations, ...ciOperations, ...issueOperations, ...additional];
   const names = new Set<string>();
   for (const operation of operations) {
     if (!/^gh_[a-z0-9_]+$/.test(operation.name)) {

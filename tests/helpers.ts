@@ -127,10 +127,10 @@ export function loadExtension(
   return { tools, pi, activeTools, activeChanges };
 }
 
-export function toolCtx(cwd = "/tmp/checkout") {
+export function toolCtx(cwd = "/tmp/checkout", hasUI = true) {
   return {
     cwd,
-    hasUI: true,
+    hasUI,
     mode: "tui" as const,
   };
 }

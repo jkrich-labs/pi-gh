@@ -65,6 +65,25 @@ test("gh_find loads exact search and content tools for representative tasks", as
   }
 });
 
+test("gh_find loads exact issue write tools", async () => {
+  const loaded = loadExtension();
+  const tool = loaded.tools.get("gh_find");
+  assert.ok(tool);
+  const cases = [
+    ["create issue", "gh_create_issue"],
+    ["comment on issue", "gh_comment_issue"],
+    ["edit issue labels", "gh_edit_issue"],
+    ["close issue", "gh_close_issue"],
+  ] as const;
+  for (const [query, expected] of cases) {
+    const projection = projectionOf(await tool.execute(query, { query, limit: 1 }, undefined, undefined, toolCtx() as never)) as {
+      matches: Array<{ name: string }>;
+    };
+    assert.equal(projection.matches[0]?.name, expected);
+    assert.equal(loaded.activeTools.includes(expected), true);
+  }
+});
+
 test("gh_find loads CI checks, workflow jobs, and failed logs tools", async () => {
   const loaded = loadExtension();
   const tool = loaded.tools.get("gh_find");

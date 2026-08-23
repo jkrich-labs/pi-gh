@@ -4,14 +4,20 @@ import {
   createPiExecutor,
   type ContentRequestInput,
   type GhDependencies,
+  type IssueRequestInput,
   type SearchRequestInput,
 } from "./execute.ts";
 import {
   checksParameters,
   ciOperationKinds,
+  createIssueParameters,
   createRegistry,
+  editIssueParameters,
   failedLogsParameters,
   findParameters,
+  issueOperationKinds,
+  issueCommentParameters,
+  issueStateParameters,
   jobParameters,
   listDirectoryParameters,
   pullRequestDiffParameters,
@@ -52,6 +58,7 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
     const pipeline = createPipeline({
       executor,
       tempOutput: overrides.tempOutput,
+      confirm: overrides.confirm,
     });
     const registry = suppliedRegistry ?? createRegistry();
 
@@ -66,6 +73,8 @@ export function createGhExtension(overrides: GhDependencies = {}, suppliedRegist
         registerContentTool(pi, operation, pipeline);
       } else if (operation.name in ciOperationKinds) {
         registerCiTool(pi, operation, pipeline, ciOperationKinds[operation.name as keyof typeof ciOperationKinds]);
+      } else if (operation.name in issueOperationKinds) {
+        registerIssueTool(pi, operation, pipeline, issueOperationKinds[operation.name as keyof typeof issueOperationKinds]);
       } else {
         registerUnimplementedTool(pi, operation);
       }
@@ -251,6 +260,46 @@ function registerCiTool(pi: ExtensionAPI, operation: Operation, pipeline: Return
         detail: values.detail === "expanded" ? "expanded" as const : "compact" as const,
       };
       const { projection, target } = await pipeline.runCi(input, { cwd: ctx.cwd, signal });
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection) }],
+        details: { kind, target },
+      };
+    },
+  });
+}
+
+function registerIssueTool(pi: ExtensionAPI, operation: Operation, pipeline: ReturnType<typeof createPipeline>, kind: IssueRequestInput["kind"]): void {
+  const schema = operation.name === "gh_create_issue"
+    ? createIssueParameters
+    : operation.name === "gh_comment_issue"
+      ? issueCommentParameters
+      : operation.name === "gh_edit_issue"
+        ? editIssueParameters
+        : issueStateParameters;
+  pi.registerTool({
+    name: operation.name,
+    label: operation.label,
+    description: operation.description,
+    parameters: schema,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const values = params as Record<string, unknown>;
+      const extensionContext = ctx as unknown as { ui?: { confirm(title: string, message: string): Promise<boolean> } };
+      const input: IssueRequestInput = {
+        kind,
+        repo: typeof values.repo === "string" ? values.repo : undefined,
+        target: typeof values.target === "string" ? values.target : undefined,
+        title: typeof values.title === "string" ? values.title : undefined,
+        body: typeof values.body === "string" ? values.body : undefined,
+        assignees: Array.isArray(values.assignees) ? values.assignees.filter((value): value is string => typeof value === "string") : undefined,
+        labels: Array.isArray(values.labels) ? values.labels.filter((value): value is string => typeof value === "string") : undefined,
+        milestone: typeof values.milestone === "string" ? values.milestone : undefined,
+      };
+      const { projection, target } = await pipeline.runIssueWrite(input, {
+        cwd: ctx.cwd,
+        signal,
+        hasUI: ctx.hasUI,
+        confirm: extensionContext.ui?.confirm,
+      });
       return {
         content: [{ type: "text", text: JSON.stringify(projection) }],
         details: { kind, target },

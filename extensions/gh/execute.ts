@@ -5,7 +5,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyGhFailure, describeFailure, GhExecutionError, isMissingCli, redactSecrets } from "./errors.ts";
-import type { CiKind, SearchKind } from "./registry.ts";
+import type { CiKind, IssueKind, SearchKind } from "./registry.ts";
 import {
   formatHost,
   formatRepositoryTarget,
@@ -74,6 +74,17 @@ export interface CiRequestInput {
   detail?: "compact" | "expanded";
 }
 
+export interface IssueRequestInput {
+  kind: IssueKind;
+  repo?: string;
+  target?: string;
+  title?: string;
+  body?: string;
+  assignees?: string[];
+  labels?: string[];
+  milestone?: string;
+}
+
 export interface GhExecRequest {
   argv: string[];
   cwd?: string;
@@ -123,8 +134,9 @@ export function createPiExecutor(pi: ExtensionAPI): GhExecutor {
     });
 }
 
-export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOutput }) {
+export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOutput; confirm?: (title: string, message: string) => Promise<boolean> }) {
   const tempOutput = deps.tempOutput ?? createSecureTempOutput();
+  const confirm = deps.confirm;
   const authenticatedHosts = new Set<string>(["github.com"]);
   let ready = false;
   let hostsLoaded = false;
@@ -371,7 +383,43 @@ export function createPipeline(deps: { executor: GhExecutor; tempOutput?: TempOu
     };
   }
 
-  return { runView, runSearch, runContent, runCi, ensureHost };
+  async function runIssueWrite(
+    input: IssueRequestInput,
+    ctx: { cwd: string; signal?: AbortSignal; hasUI: boolean; confirm?: (title: string, message: string) => Promise<boolean> },
+  ): Promise<{ projection: Record<string, unknown>; target: ResourceTarget }> {
+    throwIfAborted(ctx.signal);
+    const target = input.kind === "create_issue"
+      ? resolveRepositoryTarget(input.repo ?? "")
+      : resolveIssueTarget(input.target ?? "");
+    await ensureGh(ctx.signal);
+    await ensureHost(target.host, ctx.signal);
+    const issueTarget = input.kind === "create_issue" ? undefined : target;
+    const effect = issueEffect(input.kind, target);
+    if (input.kind === "close_issue") {
+      const ask = ctx.confirm ?? confirm;
+      if (!ctx.hasUI || !ask) {
+        throw new GhExecutionError("validation", "Guarded GitHub writes require confirmation UI.");
+      }
+      const approved = await ask("Confirm GitHub write", effect);
+      if (!approved) {
+        return { projection: { kind: "cancelled", cancelled: true, target, effect }, target };
+      }
+    }
+    const result = await run({
+      argv: buildIssueArgv(input, target),
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: DEFAULT_TIMEOUT_MS,
+    });
+    const projection = {
+      kind: issueMutationResultKind(input.kind),
+      target: issueTarget ?? target,
+      output: result.stdout.trim(),
+    };
+    return { projection, target };
+  }
+
+  return { runView, runSearch, runContent, runCi, runIssueWrite, ensureHost };
 }
 
 export function buildViewArgv(target: ResourceTarget): string[] {
@@ -801,6 +849,76 @@ function targetJobId(target: ResourceTarget): number {
 function targetRunId(target: ResourceTarget): number {
   if (target.kind === "job" || target.kind === "workflow_run") return target.kind === "job" ? target.runId : target.runId;
   throw new GhExecutionError("validation", "A workflow-run or job target is required.");
+}
+
+function resolveIssueTarget(raw: string): Extract<ResourceTarget, { kind: "issue" }> {
+  const target = resolveResourceTarget(raw, { kind: "issue" });
+  if (target.kind !== "issue") throw new GhExecutionError("validation", "An issue target is required.");
+  return target;
+}
+
+function issueMutationResultKind(kind: IssueKind): string {
+  switch (kind) {
+    case "create_issue": return "issue_created";
+    case "comment_issue": return "issue_commented";
+    case "edit_issue": return "issue_edited";
+    case "close_issue": return "issue_closed";
+    case "reopen_issue": return "issue_reopened";
+    default: return assertNever(kind);
+  }
+}
+
+function issueEffect(kind: IssueKind, target: ResourceTarget): string {
+  const repository = formatRepositoryTarget(target) ?? "repository";
+  if (kind === "create_issue") return `Create issue in ${repository}`;
+  if (kind === "close_issue") return `Close issue ${repository}#${targetIssueNumber(target)}`;
+  return `${kind.replace("_issue", "")} issue ${repository}#${targetIssueNumber(target)}`;
+}
+
+function targetIssueNumber(target: ResourceTarget): number {
+  if (target.kind !== "issue") throw new GhExecutionError("validation", "An issue target is required.");
+  return target.number;
+}
+
+function buildIssueArgv(input: IssueRequestInput, target: ResourceTarget): string[] {
+  const repository = cliRepositoryTarget(target);
+  if (input.kind === "create_issue") {
+    return [
+      "issue",
+      "create",
+      "--repo",
+      repository,
+      "--title",
+      input.title ?? "",
+      ...(input.body !== undefined ? ["--body", input.body] : []),
+      ...repeatFlags("--assignee", input.assignees),
+      ...repeatFlags("--label", input.labels),
+      ...(input.milestone ? ["--milestone", input.milestone] : []),
+    ];
+  }
+  const number = targetIssueNumber(target);
+  if (input.kind === "comment_issue") {
+    return ["issue", "comment", String(number), "--repo", repository, "--body", input.body ?? ""];
+  }
+  if (input.kind === "edit_issue") {
+    return [
+      "issue",
+      "edit",
+      String(number),
+      "--repo",
+      repository,
+      ...(input.title !== undefined ? ["--title", input.title] : []),
+      ...(input.body !== undefined ? ["--body", input.body] : []),
+      ...repeatFlags("--add-assignee", input.assignees),
+      ...repeatFlags("--add-label", input.labels),
+      ...(input.milestone ? ["--milestone", input.milestone] : []),
+    ];
+  }
+  return ["issue", input.kind === "close_issue" ? "close" : "reopen", String(number), "--repo", repository];
+}
+
+function repeatFlags(flag: string, values: string[] | undefined): string[] {
+  return (values ?? []).flatMap((value) => [flag, value]);
 }
 
 export function projectRepository(raw: unknown): Record<string, unknown> {

@@ -59,6 +59,19 @@ test("gh_view rejects resource target URLs that include credentials", async () =
   );
 });
 
+test("write bodies preserve multiline text, mentions, quotes, and shell metacharacters", async () => {
+  const executor = scriptedExecutor();
+  const { tools } = loadExtension({ executor: executor.execute });
+  const tool = tools.get("gh_comment_issue");
+  assert.ok(tool);
+  const body = "line one\n@alice \"quoted\"; echo $(whoami) && $HOME";
+  await callView(tool, { target: "cli/cli#42", body });
+  const comment = executor.calls.find((call) => call.argv[0] === "issue");
+  assert.ok(comment);
+  assert.equal(comment.argv.includes(body), true);
+  assert.equal(comment.argv.some((part) => part.includes("sh -c") || part === "&&"), false);
+});
+
 test("credentials never appear in projections or errors", async () => {
   const token = "ghp_exampleSecretTokenValue1234567890";
   const executor = scriptedExecutor({
